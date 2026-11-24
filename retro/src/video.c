@@ -1,6 +1,7 @@
 /* The picture. On the handhelds (kms): DRM master on the card with the two panels (the RG DS's DSI-1 and DSI-2, the
- * top one named by BANANADS_TOP, as BananaDS's frontend_kms finds them), the game on one panel scaled by a whole number
- * (pixel-perfect: 2x on a 640x480 panel, 4x on 1024x768) and centred, the card on the other. Frames go to the screen
+ * top one named by BANANADS_TOP, as BananaDS's frontend_kms finds them), the game on one panel, scaled to fit
+ * keeping its aspect ratio (default) or by a whole number (2x on a 640x480 panel, 4x on 1024x768), centred; the card on
+ * the other. Frames go to the screen
  * by page flips through three dumb buffers (the newest frame waits for the next flip: never a tear, never a wait).
  * The modes stay as they are; closing the device gives everything back.
  * Elsewhere (null): the same scaling into memory, for tests (--dump-frame). */
@@ -31,7 +32,11 @@ static int g_game = 0;            /* the game's panel (0 top, 1 bottom) */
 static int g_npanels = 2;
 static uint16_t *g_frame;         /* the last frame, as the core gave it */
 static int g_fw, g_fh;
-static int g_k = 1, g_ox, g_oy;   /* the scale and where the picture starts */
+static int g_k = 1, g_ox, g_oy;   /* the whole-number scale, and where the picture starts */
+static int g_ow, g_oh;            /* the picture's size on the panel */
+static int g_scale_fit = 1;       /* 1 fit (default), 0 integer */
+static unsigned g_dirty;          /* buffers whose borders are stale (bit per game buffer) */
+static uint16_t g_xmap[4096], g_ymap[4096];
 static uint32_t g_lut[65536];
 static px_canvas g_card;
 static uint32_t *g_null_game;     /* null: the game panel as it would be shown */
@@ -45,47 +50,80 @@ static void lut_init(void)
     }
 }
 
-static void layout(void)
-{
-    int kx, ky;
-    if (g_fw <= 0 || g_fh <= 0) return;
-    kx = g_W / g_fw;
-    ky = g_H / g_fh;
-    g_k = kx < ky ? kx : ky;
-    if (g_k < 1) g_k = 1;
-    g_ox = (g_W - g_fw * g_k) / 2;
-    g_oy = (g_H - g_fh * g_k) / 2;
-    if (g_ox < 0) g_ox = 0;
-    if (g_oy < 0) g_oy = 0;
-}
-
-/* the last frame into a panel-sized buffer (pitch in pixels); the border is left as it is */
-static void render_into(uint32_t *dst, int pitch)
-{
-    static uint32_t row[4096];
-    int y, x, j;
-    const int ow = g_fw * g_k;
-    if (!g_frame || ow > 4096) return;
-    for (y = 0; y < g_fh && g_oy + y * g_k < g_H; y++) {
-        const uint16_t *s = g_frame + (size_t)y * (size_t)g_fw;
-        uint32_t *o = row;
-        if (g_k == 1)
-            for (x = 0; x < g_fw; x++) *o++ = g_lut[s[x]];
-        else
-            for (x = 0; x < g_fw; x++) {
-                const uint32_t p = g_lut[s[x]];
-                for (j = 0; j < g_k; j++) *o++ = p;
-            }
-        for (j = 0; j < g_k && g_oy + y * g_k + j < g_H; j++)
-            memcpy(dst + (size_t)(g_oy + y * g_k + j) * (size_t)pitch + g_ox, row, (size_t)ow * 4);
-    }
-}
-
 static void clear(uint32_t *dst, int pitch, uint32_t col)
 {
     int y, x;
     for (y = 0; y < g_H; y++)
         for (x = 0; x < g_W; x++) dst[(size_t)y * (size_t)pitch + x] = col;
+}
+
+/* Fit: the largest size that fits the panel keeping the game's own aspect ratio (a GBA's 3:2), centred. Integer: the
+ * largest whole number. Both are nearest-neighbour from one table per axis, taken from the middle of each destination
+ * pixel, so source pixels are spread as evenly as the ratio allows and pixel art stays crisp. */
+static void layout(void)
+{
+    if (g_fw <= 0 || g_fh <= 0) return;
+    if (g_scale_fit) {
+        if ((long)g_W * g_fh <= (long)g_H * g_fw) {
+            g_ow = g_W;
+            g_oh = (int)((long)g_W * g_fh / g_fw);
+        } else {
+            g_oh = g_H;
+            g_ow = (int)((long)g_H * g_fw / g_fh);
+        }
+    } else {
+        int kx = g_W / g_fw, ky = g_H / g_fh;
+        g_k = kx < ky ? kx : ky;
+        if (g_k < 1) g_k = 1;
+        g_ow = g_fw * g_k;
+        g_oh = g_fh * g_k;
+    }
+    if (g_ow < 1) g_ow = 1;
+    if (g_oh < 1) g_oh = 1;
+    if (g_ow > g_W) g_ow = g_W;
+    if (g_oh > g_H) g_oh = g_H;
+    g_ox = (g_W - g_ow) / 2;
+    g_oy = (g_H - g_oh) / 2;
+    {
+        int i;
+        for (i = 0; i < g_ow; i++) g_xmap[i] = (uint16_t)(((2L * i + 1) * g_fw) / (2L * g_ow));
+        for (i = 0; i < g_oh; i++) g_ymap[i] = (uint16_t)(((2L * i + 1) * g_fh) / (2L * g_oh));
+    }
+}
+
+void px_video_scale_set(int fit)
+{
+    fit = fit ? 1 : 0;
+    if (fit == g_scale_fit) return;
+    g_scale_fit = fit;
+    layout();
+    g_dirty = ~0u;   /* the borders change: every buffer cleared before it is drawn on again */
+}
+int px_video_scale_get(void) { return g_scale_fit; }
+
+/* the last frame into a panel-sized buffer (pitch in pixels); the border is left as it is. buf: which buffer (the
+ * dirty bits say whether it still holds the old layout's borders) */
+static void render_into(uint32_t *dst, int pitch, int buf)
+{
+    static uint32_t row[4096];
+    int y, x;
+    if (!g_frame || g_ow > 4096 || g_oh <= 0) return;
+    if (g_dirty & (1u << buf)) {
+        clear(dst, pitch, 0xFF000000u);
+        g_dirty &= ~(1u << buf);
+    }
+    for (y = 0; y < g_oh; y++) {
+        uint32_t *d = dst + (size_t)(g_oy + y) * (size_t)pitch + g_ox;
+        if (y > 0 && g_ymap[y] == g_ymap[y - 1]) {
+            memcpy(d, d - pitch, (size_t)g_ow * 4);
+            continue;
+        }
+        {
+            const uint16_t *s = g_frame + (size_t)g_ymap[y] * (size_t)g_fw;
+            for (x = 0; x < g_ow; x++) row[x] = g_lut[s[g_xmap[x]]];
+        }
+        memcpy(d, row, (size_t)g_ow * 4);
+    }
 }
 
 /* ======================================== kms ======================================== */
@@ -383,14 +421,8 @@ void px_video_frame(const uint16_t *src, int w, int h, int pitch)
         g_fw = w;
         g_fh = h;
         layout();
-#ifdef PX_HAVE_KMS
-        if (g_kms) {
-            int i;
-            for (i = 0; i < NGB; i++) clear((uint32_t *)(void *)gbuf[i].map, (int)(gbuf[i].pitch / 4), 0xFF000000u);
-        }
-#endif
-        if (g_null_game) clear(g_null_game, g_W, 0xFF000000u);
-        px_log("[video] the game is %dx%d, shown %dx at %d,%d", w, h, g_k, g_ox, g_oy);
+        g_dirty = ~0u;   /* every buffer cleared before its next frame */
+        px_log("[video] the game is %dx%d, shown %dx%d at %d,%d (%s)", w, h, g_ow, g_oh, g_ox, g_oy, g_scale_fit ? "fit" : "integer");
     }
     for (y = 0; y < h; y++) memcpy(g_frame + (size_t)y * (size_t)w, src + (size_t)y * (size_t)pitch, (size_t)w * 2);
 #ifdef PX_HAVE_KMS
@@ -403,13 +435,13 @@ void px_video_frame(const uint16_t *src, int w, int h, int pitch)
                 if (i != k_front && i != k_pend) { t = i; break; }
         }
         if (t < 0) return;   /* (can't happen with three buffers) */
-        render_into((uint32_t *)(void *)gbuf[t].map, (int)(gbuf[t].pitch / 4));
+        render_into((uint32_t *)(void *)gbuf[t].map, (int)(gbuf[t].pitch / 4), t);
         k_queued = t;
         k_flip_queued();
         return;
     }
 #endif
-    render_into(g_null_game, g_W);
+    render_into(g_null_game, g_W, 0);
 }
 
 px_canvas *px_video_card(void) { return &g_card; }
@@ -446,7 +478,7 @@ int px_video_grab(int panel, uint32_t *dst, int w, int h)
     if (w != g_W || h != g_H) return 0;
     if (panel == g_game || (g_kms && g_npanels < 2)) {
         clear(dst, w, 0xFF000000u);
-        render_into(dst, w);
+        render_into(dst, w, 31);
     } else
         memcpy(dst, g_card.px, (size_t)w * (size_t)h * 4);
     return 1;
@@ -480,7 +512,7 @@ void px_video_repaint(void)
         int t = k_front >= 0 ? k_front : 0;
         k_pend = k_queued = -1;
         planes_clean();
-        render_into((uint32_t *)(void *)gbuf[t].map, (int)(gbuf[t].pitch / 4));
+        render_into((uint32_t *)(void *)gbuf[t].map, (int)(gbuf[t].pitch / 4), t);
         if (setcrtc(game_i(), gbuf[t].fb)) px_log("[kms] repaint: the game panel (%s)", strerror(errno));
         k_front = t;
         if (g_npanels == 2) {

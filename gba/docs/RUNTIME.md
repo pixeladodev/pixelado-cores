@@ -20,6 +20,7 @@ there.
 |---|---|
 | the ROM | the last argument (a `.gba`; a `.zip` is unpacked by the launcher) |
 | the save | `<save-dir>/<save-name>.srm`: BananaOS keeps every GBA core's saves in `/data/saves/gba/<game>.srm` (RetroArch, BananaFront), so the same save goes on in any of them. Without `--save-dir`, beside the ROM |
+| the settings | `/data/pixelado-cores/gba.conf` (`PIXELADO_CORE_CONFIG`: the folder): `screen.scale=fit\|integer`, set from Party's menu |
 | the log | `--log FILE`, else stderr |
 | the screen | DRM master on `/dev/dri/card0` (`PIXELADO_CORE_DRI`), the two panels |
 | the sound | ALSA `default` (`PIXELADO_CORE_ALSA`) |

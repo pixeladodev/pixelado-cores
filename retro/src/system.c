@@ -4,10 +4,15 @@
  * are the theme's WAVs. Elsewhere every call does nothing. The slow ones (the volume script) run on a worker thread. */
 #include "px.h"
 
+#ifndef PX_SYS
+#define PX_SYS "retro"
+#endif
+
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static const char *BLN[2] = {"backlight1", "backlight0"};   /* top, bottom */
@@ -261,4 +266,64 @@ void px_sys_sound(int id)
         }
     }
     if (id >= 0 && id < 3 && g_snd[id].pcm) px_audio_sfx(g_snd[id].pcm, g_snd[id].frames, g_snd[id].rate);
+}
+
+/* ---- the core's own settings: one small file of `key=value` lines per core, kept across games ---- */
+static void conf_path(char *p, size_t cap, int mk)
+{
+    const char *d = getenv("PIXELADO_CORE_CONFIG");
+    char dir[200];
+    snprintf(dir, sizeof dir, "%s", d && *d ? d : "/data/pixelado-cores");
+    if (mk) {
+        char *s;
+        for (s = dir + 1; *s; s++)
+            if (*s == '/') { *s = 0; mkdir(dir, 0755); *s = '/'; }
+        mkdir(dir, 0755);
+    }
+    snprintf(p, cap, "%s/%s.conf", dir, PX_SYS);
+}
+
+int px_sys_conf_get(const char *key, char *out, size_t cap)
+{
+    char p[300], line[160];
+    FILE *f;
+    const size_t kl = strlen(key);
+    int found = 0;
+    conf_path(p, sizeof p, 0);
+    f = fopen(p, "r");
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f)) {
+        if (!strncmp(line, key, kl) && line[kl] == '=') {
+            size_t n;
+            snprintf(out, cap, "%s", line + kl + 1);
+            n = strlen(out);
+            while (n && (out[n - 1] == '\n' || out[n - 1] == '\r')) out[--n] = 0;
+            found = 1;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+void px_sys_conf_set(const char *key, const char *value)
+{
+    char p[300], tmp[310], line[160], keep[1024] = "";
+    FILE *f;
+    const size_t kl = strlen(key);
+    conf_path(p, sizeof p, 1);
+    f = fopen(p, "r");
+    if (f) {
+        while (fgets(line, sizeof line, f))
+            if (!(!strncmp(line, key, kl) && line[kl] == '=') && strlen(keep) + strlen(line) < sizeof keep) strcat(keep, line);
+        fclose(f);
+    }
+    snprintf(tmp, sizeof tmp, "%s.tmp", p);
+    f = fopen(tmp, "w");
+    if (!f) return;
+    fputs(keep, f);
+    fprintf(f, "%s=%s\n", key, value);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    rename(tmp, p);
 }

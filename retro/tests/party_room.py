@@ -97,6 +97,9 @@ def host_party(p):
     p.send("CMD op=set key=fps value=1")
     ok = p.wait_for("OK")
     p.events.append("ok %s" % (ok or {}).get("op"))
+    p.send("CMD op=set key=screen.scale value=integer")
+    ok = p.wait_for("OK")
+    p.events.append("scale %s" % (ok or {}).get("key"))
     time.sleep(1.5)
     p.send("SCREEN state=give")
     tk = p.wait_for("SCREEN", "taken")
@@ -173,6 +176,7 @@ def start(args, party_script, room_path, end_after, name):
 def main():
     port = 20000 + os.getpid() % 20000
     with tempfile.TemporaryDirectory() as t:
+        os.environ["PIXELADO_CORE_CONFIG"] = os.path.join(t, "conf")   # (the core's own settings, not the machine's)
         rom = os.path.join(t, "game.bin")
         open(rom, "w").close()
         with open(os.path.join(t, "host.script"), "w") as f:
@@ -201,6 +205,7 @@ def main():
         check("host: its menu released the screen (reason=menu)", "released menu" in hparty.events)
         check("host: the PXF1 frame came with it", "frame True" in hparty.events)
         check("host: CMD op=set answered", "ok set" in hparty.events)
+        check("host: CMD op=set key=screen.scale answered", "scale screen.scale" in hparty.events)
         check("host: the screen taken back after give", "taken True" in hparty.events)
         check("host: quit from Party's menu, exit 0", "ok quit" in hparty.events and hrc == 0)
         check("guest: released with reason=hold", "released hold" in gparty.events)

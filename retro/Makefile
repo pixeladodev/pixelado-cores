@@ -63,6 +63,7 @@ $(OUT)/pixelado-core-fake: $(SRC) $(HDR) tests/fake_core.c
 
 test: $(OUT)/pixelado-core-fake
 	sh tests/loopback.sh $(OUT)/pixelado-core-fake
+	sh tests/scale.sh $(OUT)/pixelado-core-fake
 
 clean:
 	rm -rf $(OUT)

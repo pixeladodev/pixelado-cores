@@ -23,7 +23,7 @@ static int fails;
 
 /* ---- the core's side: a fake host that records what Party asked for ---- */
 typedef struct {
-    int vol, bri, sound, holds_on, holds_off, quits, others_ms, masters_dropped, masters_taken, repaints, idles;
+    int vol, bri, scale, sound, holds_on, holds_off, quits, others_ms, masters_dropped, masters_taken, repaints, idles;
     long long t0;
 } fake;
 
@@ -52,8 +52,8 @@ static int f_others(void *c, char *names, size_t cap)
     names[0] = 0;
     return 0;
 }
-static void f_open(void *c, int *v, int *b, int *fps) { (void)c; *v = 50; *b = 80; *fps = 0; }
-static void f_set(void *c, const char *k, int v) { fake *f = c; if (!strcmp(k, "volume")) f->vol = v; if (!strcmp(k, "brightness")) f->bri = v; }
+static void f_open(void *c, int *v, int *b, int *fps, int *scale) { (void)c; *v = 50; *b = 80; *fps = 0; *scale = 1; }
+static void f_set(void *c, const char *k, int v) { fake *f = c; if (!strcmp(k, "volume")) f->vol = v; if (!strcmp(k, "brightness")) f->bri = v; if (!strcmp(k, "screen.scale")) f->scale = v; }
 static int f_tick(void *c, int *v, int *b) { (void)c; (void)v; (void)b; return 0; }
 static void f_close(void *c) { (void)c; }
 static void f_sound(void *c, int id) { ((fake *)c)->sound = id; }
@@ -90,6 +90,7 @@ static int core_child(int fd, int scenario)
     case 1:   /* menu, settings, Party gives the screen back */
         if (r != PX_PARTY_DONE) return 10;
         if (f.vol != 30) return 11;
+        if (f.scale != 0) return 16;   /* CMD op=set key=screen.scale value=integer */
         if (f.sound != 1) return 12;
         if (f.holds_off != 1) return 13;
         if (f.masters_dropped != 1 || f.masters_taken != 1 || f.repaints != 1) return 14;
@@ -182,6 +183,16 @@ static int run(int scenario)
     CHECK(expect(sv[0], "HELLO", NULL, &l), "no HELLO");
     CHECK(!strcmp(px_line_str(&l, "engine", ""), "gba") && !strcmp(px_line_str(&l, "title", ""), "Link Test"),
           "HELLO engine/title");
+    {
+        px_line o;
+        CHECK(expect(sv[0], "OPT", NULL, &o), "no OPT");
+        if (scenario == 1) {
+            int found = strcmp(px_line_str(&o, "key", ""), "screen.scale") == 0;
+            while (!found && expect(sv[0], "OPT", NULL, &o)) found = strcmp(px_line_str(&o, "key", ""), "screen.scale") == 0;
+            CHECK(found && !strcmp(px_line_str(&o, "type", ""), "enum") && !strcmp(px_line_str(&o, "value", ""), "1") &&
+                      !strcmp(px_line_str(&o, "choices", ""), "integer,fit"), "OPT screen.scale enum");
+        }
+    }
     CHECK(expect(sv[0], "SCREEN", "released", &l), "no SCREEN released");
     if (scenario == 1) {
         uint8_t *m;
@@ -212,6 +223,8 @@ static int run(int scenario)
     if (scenario == 1) {
         say(sv[0], "CMD op=set key=volume value=30");
         CHECK(expect(sv[0], "OK", NULL, &l) && !strcmp(px_line_str(&l, "key", ""), "volume"), "OK op=set");
+        say(sv[0], "CMD op=set key=screen.scale value=integer");
+        CHECK(expect(sv[0], "OK", NULL, &l) && !strcmp(px_line_str(&l, "key", ""), "screen.scale"), "OK op=set screen.scale");
         say(sv[0], "SOUND id=select");
         say(sv[0], "PING t=5");
         CHECK(expect(sv[0], "PONG", NULL, &l) && !strcmp(px_line_str(&l, "t", ""), "5"), "PONG");

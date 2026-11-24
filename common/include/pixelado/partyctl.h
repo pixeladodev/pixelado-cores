@@ -34,9 +34,10 @@ typedef struct px_party_host {
     /* the group's pause: ours on or off; the others holding it (their names, '\n' between them, into names) */
     void (*hold_set)(void *ctx, int on);
     int (*hold_others)(void *ctx, char *names, size_t cap);
-    /* the menu's settings: as the menu opens (fps -1: no FPS counter), a change, a tick every 500 ms while it is open
+    /* the menu's settings: as the menu opens (fps -1: no FPS counter; scale -1: the core has no
+     * screen scale setting, else 0 integer, 1 fit, sent as OPT key=screen.scale type=enum), a change, a tick every 500 ms while it is open
      * (1: the handheld's own keys moved the volume or the brightness), and its close (the brightness saved) */
-    void (*opts_open)(void *ctx, int *vol, int *bri, int *fps);
+    void (*opts_open)(void *ctx, int *vol, int *bri, int *fps, int *scale);
     void (*opt_set)(void *ctx, const char *key, int value);
     int (*opts_tick)(void *ctx, int *vol, int *bri);
     void (*opts_close)(void *ctx);

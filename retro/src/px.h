@@ -44,7 +44,7 @@ typedef struct px_card {
 } px_card;
 void px_card_draw(px_canvas *c, const px_card *k);
 
-/* ---- video: the game on one panel, integer-scaled; the card on the other ---- */
+/* ---- video: the game on one panel, scaled (fit or whole numbers); the card on the other ---- */
 typedef struct px_video_cfg {
     const char *kind;     /* "kms" or "null" */
     const char *top;      /* the top panel's connector name (BANANADS_TOP: DSI-2 on the RG DS) */
@@ -58,6 +58,8 @@ void px_video_frame(const uint16_t *src, int w, int h, int pitch);
 /* the card panel: draw into the canvas, then commit */
 px_canvas *px_video_card(void);
 void px_video_card_commit(void);
+void px_video_scale_set(int fit);     /* 1: the largest size that keeps the game's aspect ratio; 0: whole numbers only */
+int px_video_scale_get(void);
 void px_video_service(void);          /* page flips that finished */
 void px_video_panel_size(int *w, int *h);
 int px_video_grab(int panel, uint32_t *dst, int w, int h);
@@ -136,6 +138,9 @@ void px_sys_volume_set(int v);
 int px_sys_brightness_get(void);
 void px_sys_brightness_set(int v);
 void px_sys_brightness_save(void);
+/* the core's own settings, `key=value` lines in /data/pixelado-cores/<sys>.conf (PIXELADO_CORE_CONFIG: the folder) */
+int px_sys_conf_get(const char *key, char *out, size_t cap);   /* 1: found */
+void px_sys_conf_set(const char *key, const char *value);
 int px_sys_opts_tick(int *vol, int *bri);
 void px_sys_sound(int id);
 

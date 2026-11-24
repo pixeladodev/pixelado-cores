@@ -58,14 +58,15 @@ static void usage(void)
             "  --party-fd FD           Pixelado Party's channel (PIXELADO_PARTY_FD)\n"
             "  --room-ctl SOCK         the room's socket (PIXELADO_ROOM_CTL)\n"
             "  --room-game GID         the room's game id (PIXELADO_ROOM_GAME)\n"
-            "  --set key=value         party.fd, room.ctl, room.gid (as the DS core takes them)\n"
+            "  --set key=value         party.fd, room.ctl, room.gid, link.port, screen.scale\n"
             "  --save-dir DIR          where the save goes (<save-dir>/<save-name>" PX_SAVE_EXT ")\n"
             "  --save-name NAME        the save's name (default: the ROM's, without its extension)\n"
             "  --system-dir DIR        the BIOS folder (optional)\n"
             "  --option key=value      a core option\n"
             "  --title TEXT            the game's name as shown\n"
+            "  --scale fit|integer     the game's size: the largest that keeps its aspect ratio (default), or whole numbers\n"
             "  --screen top|bottom     the game's panel (top); the card on the other\n"
-            "  --video kms|null  --audio alsa|null  --input evdev|none|script:FILE\n"
+            "  --video kms|null  --null-size WxH (the null panels' size, tests)  --audio alsa|null  --input evdev|none|script:FILE\n"
             "  --frames N  --dump-frame N:FILE.ppm  --unpaced  --test-pause-ms N  --log FILE  --fps\n");
 }
 
@@ -133,9 +134,17 @@ static int h_grab(void *c, int p, uint32_t *d, int w, int h) { (void)c; return p
 static void h_repaint(void *c) { (void)c; g_card_valid = 0; card_update(); px_video_repaint(); }
 static void h_hold(void *c, int on) { (void)c; px_link_hold(on); }
 static int h_others(void *c, char *n, size_t cap) { (void)c; return px_link_holders(n, cap); }
-static void h_opts_open(void *c, int *v, int *b, int *f)
+/* the screen scale: fit or integer, live; kept in the core's own settings so the next game starts with it */
+static void scale_apply(int fit, int save)
+{
+    px_video_scale_set(fit);
+    if (save) px_sys_conf_set("screen.scale", fit ? "fit" : "integer");
+}
+static int scale_parse(const char *v) { return !strcmp(v, "integer") || !strcmp(v, "int") || !strcmp(v, "0") ? 0 : 1; }
+static void h_opts_open(void *c, int *v, int *b, int *f, int *sc)
 {
     (void)c;
+    *sc = px_video_scale_get();
     *v = px_sys_volume_get();
     *b = px_sys_brightness_get();
     *f = g_fps_on;
@@ -146,6 +155,7 @@ static void h_opt_set(void *c, const char *k, int v)
     if (!strcmp(k, "volume")) px_sys_volume_set(v);
     else if (!strcmp(k, "brightness")) px_sys_brightness_set(v);
     else if (!strcmp(k, "fps")) g_fps_on = v != 0;
+    else if (!strcmp(k, "screen.scale")) scale_apply(v != 0, 1);
 }
 static int h_tick(void *c, int *v, int *b) { (void)c; return px_sys_opts_tick(v, b); }
 static void h_opts_close(void *c) { (void)c; px_sys_brightness_save(); }
@@ -284,7 +294,7 @@ int main(int argc, char **argv)
     px_link_cfg lc;
     double fps;
     long long next, fps_t0;
-    int fps_n = 0;
+    int fps_n = 0, cli_scale = -1, null_w = 0, null_h = 0;
 
     if (!top || !*top) top = getenv("BANANADS_TOP");
     if (getenv("PIXELADO_ROOM_PLAYER")) g_player = atoi(getenv("PIXELADO_ROOM_PLAYER"));
@@ -313,6 +323,8 @@ int main(int argc, char **argv)
         else if (TAKE("--system-dir")) system_dir = v;
         else if (TAKE("--option")) { if (nopts < 32) opts[nopts++] = v; }
         else if (TAKE("--title")) title = v;
+        else if (TAKE("--null-size")) { null_w = atoi(v); null_h = strchr(v, 'x') ? atoi(strchr(v, 'x') + 1) : 0; }
+        else if (TAKE("--scale")) { cli_scale = scale_parse(v); }
         else if (TAKE("--screen")) screen = !strcmp(v, "bottom");
         else if (TAKE("--top")) top = v;
         else if (TAKE("--video")) video = v;
@@ -329,6 +341,7 @@ int main(int argc, char **argv)
             else if (!strncmp(v, "room.ctl=", 9)) room_ctl = v + 9;
             else if (!strncmp(v, "room.gid=", 9)) gid = v + 9;
             else if (!strncmp(v, "link.port=", 10)) port = atoi(v + 10);
+            else if (!strncmp(v, "screen.scale=", 13)) cli_scale = scale_parse(v + 13);
             else fprintf(stderr, "pixelado-core-%s: --set %s ignored\n", PX_SYS, v);
         } else if (a[0] == '-' && a[1] == '-') {
             fprintf(stderr, "pixelado-core-%s: unknown option %s\n", PX_SYS, a);
@@ -389,6 +402,13 @@ int main(int argc, char **argv)
     vc.kind = video;
     vc.top = top;
     vc.game_panel = screen;
+    vc.null_w = null_w;
+    vc.null_h = null_h;
+    {   /* the scale: the core's saved setting (default fit), the command line over it */
+        char sv[16];
+        if (px_sys_conf_get("screen.scale", sv, sizeof sv)) px_video_scale_set(scale_parse(sv));
+        if (cli_scale >= 0) px_video_scale_set(cli_scale);
+    }
     if (!px_video_open(&vc)) {
         px_log("no display");
         px_room_close("error");

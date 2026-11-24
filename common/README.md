@@ -41,7 +41,7 @@ Lines of `VERB key=value ...`, one per `\n`, values with the bytes under 0x21, `
 | Message | Direction | What |
 |---|---|---|
 | `HELLO role=engine engine=<sys> proto=1 pid= caps=pause-own,screen resume= gid= title=` | core → Party | who it is, the game's name |
-| `OPT key=volume\|brightness type=int value= min= max=`, `OPT key=fps type=bool value=`, `OPTS_END` | core → Party | the settings Party's menu shows |
+| `OPT key=volume\|brightness type=int value= min= max=`, `OPT key=fps type=bool value=`, `OPT key=screen.scale type=enum value=0\|1 choices=integer,fit` (the retro cores), `OPTS_END` | core → Party | the settings Party's menu shows |
 | `LAN have= mode= state= np= max= lock= addr= msg= ...`, `LANP name= host= me= ping= hold=`, `LAN_END` | core → Party | the multiplayer session, for the menu's card and its multiplayer page |
 | `HOLD n= names=` | core → Party | who holds the group's pause (names separated by `\n`) |
 | `SCREEN state=released reason=menu\|hold seq=` (+ the frame's fd) | core → Party | the screen let go of |

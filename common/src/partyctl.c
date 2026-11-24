@@ -218,11 +218,12 @@ static int write_frame(const px_party_host *h, int *fresh)
     return 1;
 }
 
-static void send_opts(int vol, int bri, int fps)
+static void send_opts(int vol, int bri, int fps, int scale)
 {
     sendf("OPT key=volume type=int value=%d min=0 max=100", vol);
     sendf("OPT key=brightness type=int value=%d min=5 max=100", bri);
     if (fps >= 0) sendf("OPT key=fps type=bool value=%d", fps ? 1 : 0);
+    if (scale >= 0) sendf("OPT key=screen.scale type=enum value=%d choices=integer,fit", scale ? 1 : 0);
     send_raw("OPTS_END", -1);
 }
 
@@ -292,7 +293,7 @@ px_party_menu_result px_party_menu(const px_party_host *h, int ours)
 {
     static px_line in[32];
     char names[512] = "", n2[512], lan[2048] = "", l2[2048];
-    int fresh = 0, vol = 50, bri = 80, fps = -1, hold_n = 0, nin, i;
+    int fresh = 0, vol = 50, bri = 80, fps = -1, scale = -1, hold_n = 0, nin, i;
     int taken = 0, held = ours, wanted = 0, quitting = 0, have_lan = 0;
     long long t0, heard, ticked, lan_at, hold_at;
     px_party_menu_result out = PX_PARTY_DONE;
@@ -303,13 +304,13 @@ px_party_menu_result px_party_menu(const px_party_host *h, int ours)
         hlog(h, "[party] no frame for Party: our own menu\n");
         return PX_PARTY_UNAVAILABLE;
     }
-    if (h->opts_open) h->opts_open(h->ctx, &vol, &bri, &fps);
+    if (h->opts_open) h->opts_open(h->ctx, &vol, &bri, &fps, &scale);
     if (h->hold_others) hold_n = h->hold_others(h->ctx, names, sizeof names);
     if (h->lan_lines) have_lan = h->lan_lines(h->ctx, lan, sizeof lan);
     if (h->drop_master && !h->drop_master(h->ctx))
         hlog(h, "[party] dropping DRM master failed (%s): Party may not get it\n", strerror(errno));
     /* what Party needs to draw first, then the screen */
-    send_opts(vol, bri, fps);
+    send_opts(vol, bri, fps, scale);
     if (have_lan) send_block(lan);
     send_hold(hold_n, names);
     {
@@ -347,7 +348,10 @@ px_party_menu_result px_party_menu(const px_party_host *h, int ours)
                 const char *op = px_line_str(l, "op", "");
                 char e[64];
                 if (!strcmp(op, "set")) {
-                    if (h->opt_set) h->opt_set(h->ctx, px_line_str(l, "key", ""), (int)px_line_num(l, "value", 0));
+                    const char *val = px_line_str(l, "value", "0");
+                    /* (an enum's value is its index, or its name) */
+                    const int num = !strcmp(val, "fit") ? 1 : !strcmp(val, "integer") ? 0 : (int)px_line_num(l, "value", 0);
+                    if (h->opt_set) h->opt_set(h->ctx, px_line_str(l, "key", ""), num);
                     px_line_esc(e, sizeof e, px_line_str(l, "key", ""));
                     sendf("OK op=set key=%s", e);
                 } else if (!strcmp(op, "lan")) {
@@ -450,7 +454,7 @@ px_party_menu_result px_party_menu(const px_party_host *h, int ours)
             if (h->opts_tick && h->opts_tick(h->ctx, &v, &br) && (v != vol || br != bri)) {
                 vol = v;
                 bri = br;
-                send_opts(vol, bri, fps);
+                send_opts(vol, bri, fps, scale);
             }
         }
     }

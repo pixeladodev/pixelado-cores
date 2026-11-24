@@ -8,20 +8,26 @@ channel (`common/`). About 3,000 lines of C99.
 |---|---|
 | `src/main.c` | the options, the loop at the core's own rate, the pause (Party's menu or our own card), the exit codes |
 | `src/core.c` | the libretro host: environment, options (`SET_VARIABLES`), the save RAM in a `.srm` |
-| `src/video.c` | KMS: the game on one panel, scaled by a whole number and centred; the card on the other; or `null` |
+| `src/video.c` | KMS: the game on one panel, scaled to fit or by a whole number, and centred; the card on the other; or `null` |
 | `src/audio.c` | ALSA `default` at the core's rate (BananaOS's plug converts), non-blocking; or `null` |
 | `src/input.c` | evdev, mapped as BananaOS maps it; or a script (tests) |
 | `src/link.c` | libretro's netpacket interface over TCP between the handhelds, with the group's pause |
 | `src/card.c` | the card on the second panel, in a 5x7 pixel font |
-| `src/system.c` | BananaOS's volume, brightness and menu sounds, for Party's menu |
+| `src/system.c` | BananaOS's volume, brightness and menu sounds, for Party's menu; the core's own settings file |
 | `include/libretro.h` | libretro's API header (MIT, the RetroArch team) |
 | `tests/` | a fake core, the link's loopback test, the Party and room test |
 
 ## On the handhelds
 
 - **Picture:** DRM master on the card with the two DSI panels (the top one is `BANANADS_TOP`'s connector, `DSI-2` on
-  the RG DS, as BananaDS finds it). The game goes on the top panel (`--screen bottom` for the other), scaled by the
-  largest whole number that fits and centred: a GBA at 2x on the RG DS's 640x480, 4x on the RG DS Plus's 1024x768.
+  the RG DS, as BananaDS finds it). The game goes on the top panel (`--screen bottom` for the other), centred and scaled by the
+  setting `screen.scale`: `fit` (the default) is the largest size that keeps the game's aspect ratio (a GBA's 3:2 is
+  640x426 on the RG DS's 640x480, 1024x682 on the RG DS Plus's 1024x768); `integer` the largest whole number (2x and
+  4x, with borders). Both are nearest-neighbour, each source pixel taken from the middle of the destination's, so the
+  pixels are spread as evenly as the ratio allows and pixel art stays crisp (software, no plane scaler). Party's menu
+  changes it live (`OPT key=screen.scale type=enum value=0|1 choices=integer,fit`, `CMD op=set key=screen.scale
+  value=integer|fit|0|1`), and the choice is kept for the next game in `/data/pixelado-cores/<sys>.conf`
+  (`PIXELADO_CORE_CONFIG`: the folder), per core.
   Three dumb buffers and page flips: the newest frame waits for the next flip. The other panel shows a card: the game,
   the player, the link, the pause.
 - **Pace:** the core's own rate (the GBA's 59.7275 Hz), each frame on an absolute deadline, nudged by at most 0.5%
@@ -65,7 +71,7 @@ pixelado-core-<sys> [options] ROM
   --party-fd FD (PIXELADO_PARTY_FD)  --room-ctl SOCK (PIXELADO_ROOM_CTL)  --room-game GID (PIXELADO_ROOM_GAME)
   --set party.fd=|room.ctl=|room.gid=|link.port=      (the DS core's spelling)
   --save-dir DIR  --save-name NAME  --system-dir DIR (the BIOS)  --option key=value (a core option)  --title TEXT
-  --screen top|bottom  --top CONNECTOR (BANANADS_TOP)  --video kms|null  --audio alsa|null  --input evdev|none|script:F
+  --scale fit|integer  --set screen.scale=fit|integer  --screen top|bottom  --top CONNECTOR (BANANADS_TOP)  --video kms|null  --audio alsa|null  --input evdev|none|script:F
   --frames N  --dump-frame N:FILE.ppm  --unpaced  --test-pause-ms N  --log FILE  --fps
 ```
 

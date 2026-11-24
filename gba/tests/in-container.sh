@@ -11,9 +11,10 @@ J=$(nproc)
 echo "=== common/ (the channel with Party, the room's socket)"
 make -s -C "$R/common" test OUT="$T/common" | grep -v '^  ' || fail=1
 
-echo "=== retro/ with the fake core (the link's loopback, Party and the room)"
+echo "=== retro/ with the fake core (the link's loopback, the scale, Party and the room)"
 make -s -C "$R/retro" fake OUT="$T/retro" >/dev/null
 sh "$R/retro/tests/loopback.sh" "$T/retro/pixelado-core-fake" | grep -E '^(ok|FAIL|loopback)' || fail=1
+sh "$R/retro/tests/scale.sh" "$T/retro/pixelado-core-fake" | grep -E '^(ok|FAIL|scale)' || fail=1
 python3 "$R/retro/tests/party_room.py" "$T/retro/pixelado-core-fake" | grep -E '^(ok|FAIL|party_room)' || fail=1
 
 echo "=== gpSP, built as on the handhelds (arm64 recompiler), and pixelado-core-gba"
