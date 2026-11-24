@@ -1,0 +1,270 @@
+From: Pixelado Dev <350114043+pixeladodev@users.noreply.github.com>
+Subject: [PATCH] Gengis separable: built in by default; without it, loaded as a plugin from the BIOS folder
+
+Gengis (BananaDS's 3D renderer; its README says it reproduces DraStic's 3D bit for bit) can be left out of the build
+(BANANADS_GENGIS off; the core's build: PIXELADO_CORE_GENGIS=0). Such a build looks for bananads-gengis-<PIXELADO_CORE_ABI>.so in
+the BIOS folder (render.gengis_plugin: another path), checks its interface version and that it was built against this
+very tree, and uses its renderer as the 3D of melonDS's or the Banana 2D engine's renderer, with the render.gengis_*
+settings and the menu's 3D effects passed through. Without one: melonDS's software 3D. The few symbols the plugin
+takes from the emulator are exported (src/gengis-plugin.dynlist).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/bananads/CMakeLists.txt b/bananads/CMakeLists.txt
+index 25d7a94..f705b35 100644
+--- a/bananads/CMakeLists.txt
++++ b/bananads/CMakeLists.txt
+@@ -249,6 +249,13 @@ if(BANANADS_GENGIS)
+     target_sources(bananads PRIVATE src/gengis_renderer.cpp)
+     target_link_libraries(bananads PRIVATE gengis)
+     target_compile_definitions(bananads PRIVATE BANANADS_GENGIS=1)
++else()
++    # Pixelado: Gengis as a plugin (src/gengis_plugin.h). PIXELADO_CORE_ABI names the tree the plugin must be built against;
++    # the symbols it takes from the emulator are exported (gengis-plugin.dynlist), nothing else
++    set(PIXELADO_CORE_ABI "none" CACHE STRING "the tree's hash, for the Gengis plugin")
++    target_sources(bananads PRIVATE src/gengis_plugin.cpp)
++    target_compile_definitions(bananads PRIVATE PIXELADO_CORE_ABI="${PIXELADO_CORE_ABI}")
++    target_link_options(bananads PRIVATE "-Wl,--dynamic-list=${CMAKE_CURRENT_SOURCE_DIR}/src/gengis-plugin.dynlist")
+ endif()
+ target_compile_definitions(bananads PRIVATE BANANADS_VERSION="${PROJECT_VERSION}")
+ 
+diff --git a/bananads/src/emu.cpp b/bananads/src/emu.cpp
+index 025cda2..8525b33 100644
+--- a/bananads/src/emu.cpp
++++ b/bananads/src/emu.cpp
+@@ -1,6 +1,8 @@
+ #include "emu.h"
+ #ifdef BANANADS_GENGIS
+ #include "gengis_renderer.h"
++#else
++#include "gengis_plugin.h"   // (Pixelado: Gengis as a plugin the user puts in the BIOS folder)
+ #endif
+ 
+ #include <dirent.h>
+@@ -2547,6 +2549,30 @@ bool Emu::load_rom(const std::string& path) {
+ #endif
+             nds_->SetRenderer(std::make_unique<GengisSoftRenderer>(*nds_, threads, defer));
+     } else
++#else
++    // Pixelado: render.renderer=gengis (the default) with the user's plugin (src/gengis_plugin.h), the same settings
++    if (const GengisPlugin* gp = cfg_.str("render.renderer", "gengis") == "gengis"
++            ? gengis_plugin(cfg_.str("render.gengis_plugin", "")) : nullptr) {
++        const int threads = (int)cfg_.num("render.gengis_threads", 3);
++        const bool defer = cfg_.flag("render.gengis_defer", false);
++        static const struct { const char* key; const char* name; long def; } sets[] = {
++            {"render.gengis_help", "help", 1}, {"sched.gengis_nice", "nice", 0}, {"render.gengis_wake", "wake", 1},
++            {"render.gengis_stats", "stats", 0}, {"render.gengis_hrneon", "hrneon", -1}, {"render.gengis_verify", "verify", 0},
++            {"render.gengis_lazy", "lazy", 0}, {"render.gengis_units", "units", 3}, {"render.gengis_units_low", "units_low", 2},
++            {"render.gengis_keyskip", "keyskip", 1}, {"render.gengis_vbwait", "vbwait", -1}, {"render.gengis_crc", "crc", 0},
++            {"render.gengis_texinval", "texinval", 1}, {"render.gengis_zva", "zva", 1}, {"render.gengis_trim", "trim", 1},
++            {"render.gengis_reuse", "reuse", 1},
++        };
++        for (const auto& e : sets) gp->set(e.name, cfg_.num(e.key, e.def));
++        gp->set_effects(cfg_.flag("render.edge_marking", true), cfg_.flag("render.fog", true));
++#ifdef BANANADS_2D
++        if (banana2d) {
++            nds_->SetRenderer(std::make_unique<GengisPluginOn<melonDS::BananaRenderer>>(*nds_, gp, threads, defer, scale));
++            scale_ = scale;
++        } else
++#endif
++            nds_->SetRenderer(std::make_unique<GengisPluginOn<melonDS::SoftRenderer>>(*nds_, gp, threads, defer));
++    } else
+ #endif
+     {
+ #ifdef BANANADS_2D
+diff --git a/bananads/src/frontend_kms.cpp b/bananads/src/frontend_kms.cpp
+index 235f04e..90e8113 100644
+--- a/bananads/src/frontend_kms.cpp
++++ b/bananads/src/frontend_kms.cpp
+@@ -70,6 +70,8 @@
+ #include "frontend.h"
+ #ifdef BANANADS_GENGIS
+ #include "gengis_renderer.h"
++#else
++#include "gengis_plugin.h"
+ #endif
+ #include "cheats.h"
+ #include "screenshot.h"
+@@ -2534,6 +2536,9 @@ int run_kms(Emu& emu, const Config& cfg) {
+ #ifdef BANANADS_GENGIS
+             if (const int fx = g_fx_req.exchange(-1, std::memory_order_acq_rel); fx >= 0)  // the menu's 3D effects
+                 GengisRenderer3D::SetEffects(fx & 1, fx & 2);
++#else
++            if (const int fx = g_fx_req.exchange(-1, std::memory_order_acq_rel); fx >= 0)  // (Pixelado: the plugin's, if any)
++                if (const GengisPlugin* gp = gengis_plugin("")) gp->set_effects(fx & 1, fx & 2);
+ #endif
+             if (const int f = g_ff.load(std::memory_order_relaxed); f != ff) {
+                 ff = f;
+diff --git a/bananads/src/gengis-plugin.dynlist b/bananads/src/gengis-plugin.dynlist
+new file mode 100644
+index 0000000..c5d554c
+--- /dev/null
++++ b/bananads/src/gengis-plugin.dynlist
+@@ -0,0 +1,11 @@
++/* Pixelado: what the Gengis plugin takes from the emulator (bananads-gengis's build lists them) */
++{
++    extern "C++" {
++        "melonDS::Platform::Log(melonDS::Platform::LogLevel, char const*, ...)";
++        "melonDS::GPU::MakeVRAMFlat_TexPalCoherent(melonDS::NonStupidBitField<256u>&)";
++        "melonDS::GPU::MakeVRAMFlat_TextureCoherent(melonDS::NonStupidBitField<1024u>&)";
++        "melonDS::VRAMTrackingSet<131072u, 16384u>::DeriveState(unsigned int const*, melonDS::GPU&)";
++        "melonDS::VRAMTrackingSet<524288u, 131072u>::DeriveState(unsigned int const*, melonDS::GPU&)";
++        "bananads::sched_off_emu_core()";
++    };
++};
+diff --git a/bananads/src/gengis_plugin.cpp b/bananads/src/gengis_plugin.cpp
+new file mode 100644
+index 0000000..ceea577
+--- /dev/null
++++ b/bananads/src/gengis_plugin.cpp
+@@ -0,0 +1,47 @@
++#include "gengis_plugin.h"
++
++#include <dlfcn.h>
++#include <string>
++
++#include "Platform.h"
++
++#ifndef PIXELADO_CORE_ABI
++#define PIXELADO_CORE_ABI "none"
++#endif
++
++using melonDS::Platform::Log;
++using melonDS::Platform::LogLevel;
++
++namespace bananads {
++
++const GengisPlugin* gengis_plugin(const std::string& path_cfg)
++{
++    static bool tried = false;
++    static const GengisPlugin* plugin = nullptr;
++    if (tried) return plugin;
++    tried = true;
++    // the BIOS folder (BANANADS_BIOS_DIR, else /data/bios), where the user's own DS files are
++    std::string path = path_cfg;
++    if (path.empty()) {
++        const char* bios = getenv("BANANADS_BIOS_DIR");
++        path = std::string(bios && *bios ? bios : "/data/bios") + "/bananads-gengis-" PIXELADO_CORE_ABI ".so";
++    }
++    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
++    if (!h) {
++        Log(LogLevel::Info, "[gengis] no plugin (%s): the 3D is melonDS's software renderer\n", dlerror());
++        return nullptr;
++    }
++    auto get = reinterpret_cast<const GengisPlugin* (*)()>(dlsym(h, "bananads_gengis_plugin"));
++    const GengisPlugin* p = get ? get() : nullptr;
++    if (!p || p->api != GENGIS_PLUGIN_API || !p->abi || std::string(p->abi) != PIXELADO_CORE_ABI) {
++        Log(LogLevel::Warn, "[gengis] %s is not for this engine (api %d, abi %s; wanted %d, %s): software 3D\n",
++            path.c_str(), p ? p->api : -1, p && p->abi ? p->abi : "?", GENGIS_PLUGIN_API, PIXELADO_CORE_ABI);
++        dlclose(h);
++        return nullptr;
++    }
++    Log(LogLevel::Info, "[gengis] plugin %s (%s)\n", path.c_str(), p->version ? p->version : "?");
++    plugin = p;   // (never unloaded: its renderer lives as long as the emulator)
++    return plugin;
++}
++
++}
+diff --git a/bananads/src/gengis_plugin.h b/bananads/src/gengis_plugin.h
+new file mode 100644
+index 0000000..cb00f49
+--- /dev/null
++++ b/bananads/src/gengis_plugin.h
+@@ -0,0 +1,55 @@
++// Pixelado: Gengis as a plugin (src/gengis_plugin_api.h). The engine can be built without Gengis (BANANADS_GENGIS off: its code is
++// rebuilt from DraStic, which such a build does not distribute) and loads bananads-gengis-<PIXELADO_CORE_ABI>.so if the user put
++// one in the BIOS folder (render.gengis_plugin: another path). Without it, or one built for another build, the 3D is
++// melonDS's software renderer.
++#pragma once
++
++#include <memory>
++#include <string>
++
++#include "GPU.h"
++#include "GPU_Soft.h"
++#ifdef BANANADS_2D
++#include "GPU_Banana.h"
++#endif
++#include "gengis_plugin_api.h"
++
++namespace bananads {
++
++// the plugin, loaded once (nullptr: none, or not this build's); the reason goes to the log
++const GengisPlugin* gengis_plugin(const std::string& path_cfg);
++
++// a software renderer (melonDS's, or BananaRenderer with the Banana 2D engine) with the plugin's renderer as its 3D
++template <class Base>
++class GengisPluginOn : public Base {
++public:
++    GengisPluginOn(melonDS::NDS& nds, const GengisPlugin* p, int threads, bool defer, int scale = 1) : Base(nds), P(p) {
++        melonDS::Renderer3D* r = P->create(this->GPU.GPU3D, threads, defer, scale);
++        Hires(this, r, scale);
++        this->Rend3D.reset(r);
++    }
++    void PreSavestate() override {
++        Drain(this);
++        P->finish_all(this->Rend3D.get());
++    }
++    void PostSavestate() override { Resync(this); }
++    void SetRenderSettings(melonDS::RendererSettings&) override {}
++private:
++    const GengisPlugin* P;
++    static void Drain(melonDS::SoftRenderer*) {}
++    static void Resync(melonDS::SoftRenderer*) {}
++    void Hires(melonDS::SoftRenderer*, melonDS::Renderer3D*, int) {}
++#ifdef BANANADS_2D
++    static void Drain(melonDS::BananaRenderer* r) { r->Drain2D(); }
++    static void Resync(melonDS::BananaRenderer* r) { r->Resync2D(); }
++    void Hires(melonDS::BananaRenderer* r, melonDS::Renderer3D* g, int scale) {
++        if (scale < 2) return;
++        using B = melonDS::BananaRenderer;
++        r->SetHires(reinterpret_cast<B::QuarterFn>(P->quarter), g, reinterpret_cast<B::QuarterRowsFn>(P->quarter_rows), scale);
++        r->SetHiresRows(reinterpret_cast<B::QuarterFn>(P->quarter_row), reinterpret_cast<B::RowsGenFn>(P->rows_gen),
++                        reinterpret_cast<B::WaitRowsFn>(P->wait_rows));
++    }
++#endif
++};
++
++}
+diff --git a/bananads/src/gengis_plugin_api.h b/bananads/src/gengis_plugin_api.h
+new file mode 100644
+index 0000000..d4e60f2
+--- /dev/null
++++ b/bananads/src/gengis_plugin_api.h
+@@ -0,0 +1,36 @@
++// The Gengis plugin's interface, version 1: what the engine asks of a bananads-gengis-<abi>.so.
++// The engine can be built without Gengis (BananaDS's 3D renderer: SuperDrastic's rasterizer, code rebuilt from DraStic, which
++// such a build does not distribute). A user who has the file puts it where the engine looks for it (like the DS BIOS and
++// firmware); with none, the 3D is melonDS's software renderer.
++// The plugin is compiled against exactly the tree it runs in (the same BananaDS, melonDS and patches): `abi`
++// must equal the emulator's PIXELADO_CORE_ABI (a hash of upstream.lock and the patches), or the emulator refuses it.
++#pragma once
++
++namespace melonDS { class GPU3D; class Renderer3D; }
++
++#define GENGIS_PLUGIN_API 1
++
++struct GengisPlugin
++{
++    int api;                       // GENGIS_PLUGIN_API
++    const char* abi;               // the tree it was built against
++    const char* version;           // e.g. "SuperDrastic e54aaa8"
++    // the renderer (render.gengis_threads, the frame deferral, render.scale 1-4)
++    melonDS::Renderer3D* (*create)(melonDS::GPU3D& gpu3d, int threads, bool defer, int scale);
++    // the render.gengis_* settings, by name ("help", "nice", "wake", "stats", "units"...): 0 for a name it doesn't know
++    int (*set)(const char* name, long value);
++    // the in-game menu's 3D effects
++    void (*set_effects)(bool edge_marking, bool fog);
++    // every bin of the frame drawn (before a savestate)
++    void (*finish_all)(melonDS::Renderer3D* r);
++    // render.scale 2-4 with the Banana 2D engine: what BananaRenderer::SetHires and SetHiresRows take (ctx: the
++    // renderer create() made): const u32* quarter(ctx, line, q), bool quarter_rows(ctx), const u32* quarter_row(ctx,
++    // line, q), unsigned rows_gen(ctx), void wait_rows(ctx, line, gen)
++    const unsigned* (*quarter)(void* ctx, unsigned line, int q);
++    bool (*quarter_rows)(void* ctx);
++    const unsigned* (*quarter_row)(void* ctx, unsigned line, int q);
++    unsigned (*rows_gen)(void* ctx);
++    void (*wait_rows)(void* ctx, unsigned line, unsigned gen);
++};
++
++extern "C" const GengisPlugin* bananads_gengis_plugin();

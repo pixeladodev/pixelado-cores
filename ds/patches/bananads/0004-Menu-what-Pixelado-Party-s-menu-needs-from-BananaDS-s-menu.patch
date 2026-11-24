@@ -1,0 +1,258 @@
+From: Pixelado Dev <350114043+pixeladodev@users.noreply.github.com>
+Subject: [PATCH] Menu: what Pixelado Party's menu needs from BananaDS's menu
+
+The in-game menu stays BananaDS's own (src/menu.c): Pixelado Party draws its own menu when it runs
+the engine (0008), and menu.c is what opens without Party. This adds to menu.c what Party's menu
+needs from the engine:
+
+- bmenu_ext_open / _set / _tick / _close / _sound (menu.h): the volume, the brightness and the FPS
+  counter set as menu.c sets them (BananaLinux's volume script, both backlights by the same step,
+  "<top> <bottom>" in /data/banana/backlight at close), the handheld's own keys read back twice a
+  second, and the menu's sounds (loaded on their own, without the menu's panels).
+- The game's name: looked up again when the game changes (in a Party room the frontend names the
+  game chosen, Emu::rom_path, not the room's own program from the command line); a file name that
+  says nothing ("4785", "rom") gives way to the cartridge banner's title; the DS menu is "DS menu".
+- A backlight that can't be written is logged once.
+- Fonts: BananaOS's Inter before DejaVu Sans when Pixelify Sans is missing, so the menu always opens.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/bananads/src/frontend_kms.cpp b/bananads/src/frontend_kms.cpp
+index 90e8113..7fad647 100644
+--- a/bananads/src/frontend_kms.cpp
++++ b/bananads/src/frontend_kms.cpp
+@@ -2302,6 +2302,10 @@ int run_kms(Emu& emu, const Config& cfg) {
+             for (size_t i = 0; i < n; i += strlen(rom + i) + 1)
+                 if (i && rom[i] && rom[i] != '-') mh.rom = rom + i;  // (the last argument: the game)
+         }
++        // the game this run plays: in a Party room the command line names the room's own program (lobby.nds), and the
++        // game chosen there came after it (load_rom): the menu's name and the swap kept per game are that one's
++        if (!emu.rom_path().empty()) mh.rom = emu.rom_path();
++        else if (emu.game() == "DS firmware") mh.rom = "@firmware";
+         if (swap_remembered(mh.rom)) {
+             dp.swapped = true;
+             Log(LogLevel::Info, "[kms] screens swapped for this game (F + SELECT, remembered)\n");
+diff --git a/bananads/src/menu.c b/bananads/src/menu.c
+index d14bfcf..cae1ad7 100644
+--- a/bananads/src/menu.c
++++ b/bananads/src/menu.c
+@@ -15,6 +15,7 @@
+ // page). A slot's picture shows both screens, top over bottom (a .pic with the top one alone: that one, one screen
+ // wide).
+ #define _GNU_SOURCE
++#include <ctype.h>
+ #include <dirent.h>
+ #include <glob.h>
+ #include <math.h>
+@@ -24,6 +25,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <strings.h>
+ #include <sys/stat.h>
+ #include <time.h>
+ #include <unistd.h>
+@@ -322,14 +324,48 @@ static int wrap2(font *F, const char *t, float px, float maxw, char *l1, char *l
+ #define NSLOT 8
+ typedef struct { int used; time_t mt; uint16_t *pic; int pic_rows, pic_tried; } slot;   /* pic_rows: 384 both screens, 192 the top */
+ static slot SL[NSLOT];
+-static char rom[512], gbase[256], gtitle[200], ggenre[100];
++static char rom[512], gbase[256], gtitle[200], ggenre[100], grom[512];
+ static int undo_ok;                 /* the undo file holds the game from before this session's last menu load */
+ static long long session_t0;
+ static int last_slot = -1;          /* the slot this session saved to or loaded last */
+ 
++static int junk_name(const char *t) {   /* a file name that says nothing: "4785", "x", "rom" */
++    int letters = 0;
++    for (const char *p = t; *p; p++) if (isalpha((unsigned char)*p)) letters++;
++    return letters < 2 || !strcasecmp(t, "rom") || !strcasecmp(t, "game");
++}
++/* the cartridge banner's title (English), its first line, UTF-16 to UTF-8 */
++static void banner_title(const char *path, char *out, size_t n) {
++    out[0] = 0;
++    size_t l = strlen(path);
++    if (l < 4 || (strcasecmp(path + l - 4, ".nds") && strcasecmp(path + l - 4, ".dsi"))) return;
++    FILE *f = fopen(path, "rb"); if (!f) return;
++    uint8_t h[4], t[256];
++    if (!fseek(f, 0x68, SEEK_SET) && fread(h, 1, 4, f) == 4) {
++        const uint32_t off = h[0] | h[1] << 8 | h[2] << 16 | (uint32_t)h[3] << 24;
++        if (off >= 0x200 && !fseek(f, (long)off + 0x340, SEEK_SET) && fread(t, 1, sizeof t, f) == sizeof t) {
++            size_t k = 0;
++            for (int i = 0; i < 128 && k + 4 < n; i++) {
++                unsigned cp = t[2 * i] | t[2 * i + 1] << 8;
++                if (!cp || cp == '\n') break;
++                if (cp < 0x80) out[k++] = (char)cp;
++                else if (cp < 0x800) { out[k++] = (char)(0xC0 | cp >> 6); out[k++] = (char)(0x80 | (cp & 63)); }
++                else { out[k++] = (char)(0xE0 | cp >> 12); out[k++] = (char)(0x80 | (cp >> 6 & 63)); out[k++] = (char)(0x80 | (cp & 63)); }
++            }
++            out[k] = 0;
++        }
++    }
++    fclose(f);
++}
+ static void game_info(void) {
+     FILE *f;
+     snprintf(rom, sizeof rom, "%s", H.rom ? H.rom : "");
++    snprintf(grom, sizeof grom, "%s", rom);
++    gtitle[0] = ggenre[0] = 0;
++    if (!strcmp(rom, "@firmware")) {   /* the DS menu, no cartridge */
++        snprintf(gbase, sizeof gbase, "firmware"); snprintf(gtitle, sizeof gtitle, "DS menu");
++        return;
++    }
+     const char *fn = strrchr(rom, '/'); fn = fn ? fn + 1 : rom;
+     snprintf(gbase, sizeof gbase, "%s", fn);
+     char *dot = strrchr(gbase, '.'); if (dot) *dot = 0;
+@@ -356,6 +392,10 @@ static void game_info(void) {
+         snprintf(gtitle, sizeof gtitle, "%s", gbase);
+         char *p = strstr(gtitle, " ("); if (p && p != gtitle) *p = 0;
+     }
++    if (junk_name(gtitle)) {        /* a name that says nothing: the cartridge's own title */
++        char b[200]; banner_title(rom, b, sizeof b);
++        if (b[0]) snprintf(gtitle, sizeof gtitle, "%s", b);
++    }
+     /* &amp; and friends, as ES writes them */
+     const char *ent[][2] = { { "&amp;", "&" }, { "&apos;", "'" }, { "&quot;", "\"" }, { "&lt;", "<" }, { "&gt;", ">" } };
+     for (char *t = gtitle; *t; t++) for (int k = 0; k < 5; k++) if (!strncmp(t, ent[k][0], strlen(ent[k][0]))) {
+@@ -364,7 +404,9 @@ static void game_info(void) {
+     mlog("[menu] game '%s' (%s)\n", gtitle, gbase);
+ }
+ static void slot_path(int n, char *out, size_t sz) { H.state_file(H.ctx, n + 1, out, (int)sz); }
+-const char *bmenu_game(void) { if (!gbase[0]) game_info(); return gtitle; }
++/* (looked up again when the game changed: in a Party room the frontend names the game chosen, after the room's program) */
++static int game_stale(void) { return !gbase[0] || strcmp(grom, H.rom ? H.rom : ""); }
++const char *bmenu_game(void) { if (game_stale()) game_info(); return gtitle; }
+ 
+ /* a savestate's picture: BananaDS's <state>.pic beside it, both screens 256x384 XRGB8888 (top over bottom), as RGB565
+  * (what draw_pic takes): *rows 384, or 192 for a picture of the top screen alone; or 0 */
+@@ -427,7 +469,10 @@ static void bl_set_pm(int i, int pm) {
+     if (mx <= 0) return;
+     int v = mx * pm / 1000; if (v < 1) v = 1;
+     snprintf(p, sizeof p, "/sys/class/backlight/%s/brightness", BLN[i]);
+-    FILE *f = fopen(p, "w"); if (f) { fprintf(f, "%d\n", v); fclose(f); }
++    FILE *f = fopen(p, "w");
++    int ok = f && fprintf(f, "%d\n", v) > 0;
++    if (f && fclose(f)) ok = 0;
++    if (!ok) { static int said; if (!said++) mlog("[menu] brightness: can't write %s\n", p); }
+ }
+ static int volume_get(void) {         /* -1: the script gave no level (the refresh then keeps what is shown) */
+     FILE *p = popen("/usr/libexec/banana/volume get 2>/dev/null", "r"); if (!p) return -1;
+@@ -565,9 +610,11 @@ static void make_rows(void) {
+ static int fonts_ready(void) {   /* the menu's and the pop-ups' fonts, loaded once */
+     const char *const med[] = { getenv("BANANADS_MENU_FONT"), "/usr/share/banana/rnds/fonts/PixelifySans-Medium.ttf",
+         "/storage/.config/emulationstation/themes/rocknixds-pixel-dark/rnds/fonts/PixelifySans-Medium.ttf",
++        "/usr/share/banana/banana/fonts/Inter-Medium.ttf",
+         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/dejavu/DejaVuSans.ttf" };
+     const char *const reg[] = { "/usr/share/banana/rnds/fonts/PixelifySans-Regular.ttf", getenv("BANANADS_MENU_FONT"),
+         "/storage/.config/emulationstation/themes/rocknixds-pixel-dark/rnds/fonts/PixelifySans-Regular.ttf",
++        "/usr/share/banana/banana/fonts/Inter-Regular.ttf",
+         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/dejavu/DejaVuSans.ttf" };
+     static int lang_done;
+     if (!lang_done) {   /* the language (BananaLinux's settings.conf), and the pixel font for its characters */
+@@ -579,8 +626,9 @@ static int fonts_ready(void) {   /* the menu's and the pop-ups' fonts, loaded on
+             mlog("[menu] language %s, translated by %s\n", lang_name(), lang_by());
+         }
+     }
+-    return font_load(&F_MED, med, 5) && font_load(&F_REG, reg, 5);
++    return font_load(&F_MED, med, 6) && font_load(&F_REG, reg, 6);
+ }
++static void sounds_load(void);
+ static int setup(void) {
+     if (inited) return inited > 0;
+     inited = -1;
+@@ -592,6 +640,14 @@ static int setup(void) {
+     }
+     if (!(bgtop = malloc((size_t)pw[0] * ph[0] * 4))) return 0;
+     if (!fonts_ready()) { mlog("[menu] no font\n"); return 0; }
++    sounds_load();
++    inited = 1;
++    return 1;
++}
++static void sounds_load(void) {
++    static int done;
++    if (done) return;
++    done = 1;
+     const char *snd[SND_N] = { "scroll.wav", "select.wav", "back.wav" };
+     for (int k = 0; k < SND_N; k++) {
+         char p[300]; const char *dir = getenv("BANANADS_MENU_SOUNDS");   /* (another folder: tests) */
+@@ -600,8 +656,6 @@ static int setup(void) {
+         if (access(p, R_OK)) snprintf(p, sizeof p, "/storage/.config/emulationstation/themes/rocknixds-pixel-dark/rnds/sounds/%s", snd[k]);
+         load_wav(k, p);
+     }
+-    inited = 1;
+-    return 1;
+ }
+ 
+ /* ---------- top panel ---------- */
+@@ -1823,7 +1877,7 @@ void bmenu_session_start(void) { session_t0 = now_ms(); }
+ int bmenu_run(int start) {
+     if (!setup()) return 0;
+     snd_on = banana_menu_sounds();
+-    if (!gbase[0]) game_info();
++    if (game_stale()) game_info();
+     mlog("[menu] open\n");
+     boost(800);
+     open_ = 1; scr = SC_MAIN; sel_main = 0; held_dir = 0;
+@@ -2109,3 +2163,42 @@ int bmenu_overlay(uint32_t *px, int pitch, int w, int h) {
+     if (op_on) { if (px) ov_blit(&OP, px, pitch, h, ov_slide(t, op_from, op_until, strip)); drew = 1; }
+     return drew;
+ }
++
++/* ---------- Pixelado Party's menu (partyctl.h): Party draws it; its settings are done here, as this menu does them ------ */
++static int ext_fps_opt(void) {   /* the frontend's FPS counter option (an on/off one), -1: none */
++    for (int n = H.opt_count ? H.opt_count(H.ctx) : 0, i = 0; i < n; i++)
++        if (H.opt_label && !strcmp(H.opt_label(H.ctx, i), "FPS counter") && H.opt_values && H.opt_values(H.ctx, i) == 2) return i;
++    return -1;
++}
++void bmenu_ext_open(int *v, int *b, int *f) {
++    sounds_load();
++    snd_on = banana_menu_sounds();
++    vol = volume_get(); if (vol < 0) vol = 50;
++    bri = brightness_get();
++    bri_changed = 0;
++    *v = vol; *b = bri;
++    const int fo = ext_fps_opt();
++    *f = fo >= 0 && H.opt_get ? H.opt_get(H.ctx, fo) != 0 : -1;
++}
++void bmenu_ext_set(const char *key, int v) {
++    if (!strcmp(key, "volume")) { v = v < 0 ? 0 : v > 100 ? 100 : v; if (v != vol) { vol = v; want(vol, -1); } }
++    else if (!strcmp(key, "brightness")) bri_set(v);
++    else if (!strcmp(key, "fps")) { const int fo = ext_fps_opt(); if (fo >= 0 && H.opt_set) H.opt_set(H.ctx, fo, v != 0); }
++}
++int bmenu_ext_tick(int *v, int *b) {   /* every 500 ms while Party's menu is open: the handheld's keys (bananad) */
++    const long long t = now_ms();
++    int changed = 0;
++    want_ex(-1, -1, 1);
++    int r = vol_read;
++    if (r >= 0) { vol_read = -1; if (r != vol && t - vol_set_at > 1500) { vol = r; changed = 1; } }
++    if (t - bri_set_at > 1500) {
++        int n = 0, sum = 0;
++        for (int i = 0; i < 2; i++) { int x = bl_pm(i); if (x > 0) { sum += x; n++; } }
++        int nb = n ? (sum / n + 5) / 10 : bri;
++        if (nb - bri >= 3 || bri - nb >= 3) { bri = brightness_get(); changed = 1; }
++    }
++    *v = vol; *b = bri;
++    return changed;
++}
++void bmenu_ext_close(void) { bri_save_now(); }
++void bmenu_ext_sound(int id) { if (id >= 0 && id < SND_N) play(id); }
+diff --git a/bananads/src/menu.h b/bananads/src/menu.h
+index df71b4a..9fab421 100644
+--- a/bananads/src/menu.h
++++ b/bananads/src/menu.h
+@@ -144,6 +144,16 @@ void bmenu_popup(const char* line1, const char* line2, int ms);
+ // first call (not while the menu is open on another thread)
+ const char* bmenu_game(void);
+ 
++// Pixelado Party's menu (partyctl.h): Party draws it, the engine does its settings as this menu does them. Open: the
++// volume and brightness now (and their bases), the FPS counter's state (-1: none); set a key's value (volume,
++// brightness, fps); tick every 500 ms while it is open (1: the handheld's keys moved one); close (the brightness
++// saved); a menu sound (0 move, 1 select, 2 back)
++void bmenu_ext_open(int* vol, int* bri, int* fps);
++void bmenu_ext_set(const char* key, int v);
++int bmenu_ext_tick(int* vol, int* bri);
++void bmenu_ext_close(void);
++void bmenu_ext_sound(int id);
++
+ #ifdef __cplusplus
+ }
+ #endif

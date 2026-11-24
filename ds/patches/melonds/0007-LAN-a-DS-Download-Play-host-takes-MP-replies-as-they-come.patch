@@ -1,0 +1,153 @@
+From: Pixelado Dev <350114043+pixeladodev@users.noreply.github.com>
+Subject: [PATCH] LAN: BANANADS_LAN_DLPLAY_PIPELINE=1, a DS Download Play host that takes MP replies as they come (experiment, off)
+
+
+---
+diff --git a/src/net/LAN.cpp b/src/net/LAN.cpp
+index d55d1bb..f1cef51 100644
+--- a/src/net/LAN.cpp
++++ b/src/net/LAN.cpp
+@@ -64,6 +64,49 @@ const u32 kLocalhost = 0x0100007F;
+ // MPRecvTimeout wait) is no longer waited for, until it sends us a reply or an auth/association request again
+ const int kMPMaxMisses = 20;
+ 
++// BananaDS: DS Download Play, an experiment, off unless BANANADS_LAN_DLPLAY_PIPELINE=1. Its host sends ~10 MP
++// commands a frame with the game's data, and the wait for each reply is a round trip over Wi-Fi (3-5 ms between
++// two handhelds through a router): the host runs at ~20-30 fps while it sends. With the variable set, while we
++// send DS Download Play beacons (beacon type 0Bh, multiboot, in Nintendo's DDh element; GBATEK "DS Wifi Nintendo
++// Beacons"), RecvReplies does not wait: each MP command gets the replies already in, up to
++// kMultibootReplyWindowUS old. The host then runs at full speed, but the download never completes (two handhelds,
++// 2026-11-17: the child stays on "Downloading data..."): a reply that answered an earlier command is taken, and
++// acknowledged in our ACK, as the answer to this one, so the child believes its newer reply arrived and the two
++// sides of the transfer no longer agree. Back to the usual wait 2 s after the last such beacon.
++const u32 kMultibootBeaconHoldMS = 2000;
++const u64 kMultibootReplyWindowUS = 100000;
++
++static bool MultibootPipelineEnabled()
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        const char* e = getenv("BANANADS_LAN_DLPLAY_PIPELINE");
++        v = (e && e[0] == '1') ? 1 : 0;
++    }
++    return v == 1;
++}
++
++// a beacon (802.11 frame after the 12-byte TX header) that announces DS Download Play: Nintendo's DDh element,
++// OUI 00:09:BF:00, beacon type 0Bh at its offset 13h
++static bool IsMultibootBeacon(const u8* packet, int len)
++{
++    if (!packet || len < 12 + 24 + 12) return false;
++    const u16 fc = packet[12] | (packet[13] << 8);
++    if ((fc & 0x00FC) != 0x0080) return false;
++    int i = 12 + 24 + 12;
++    while (i + 2 <= len)
++    {
++        const int tag = packet[i], tlen = packet[i + 1];
++        if (i + 2 + tlen > len) break;
++        if (tag == 0xDD && tlen >= 0x14 && packet[i + 2] == 0x00 && packet[i + 3] == 0x09 && packet[i + 4] == 0xBF &&
++            packet[i + 5] == 0x00)
++            return packet[i + 2 + 0x13] == 0x0B;
++        i += 2 + tlen;
++    }
++    return false;
++}
++
+ // BananaDS diagnostics: Debug level (BananaDS log.level 0), "[diag] LAN" prefix, rate-limited
+ namespace landiag
+ {
+@@ -1506,6 +1549,8 @@ int LAN::SendPacketGeneric(u32 type, u8* packet, int len, u64 timestamp)
+             memcpy(MyMAC, &packet[12 + 10], 6);
+             MyMACKnown = true;
+         }
++        if (t == 0 && IsMultibootBeacon(packet, len))
++            MultibootBeaconAt = (u32)Platform::GetMSCount();
+     }
+ 
+     if (!Repeating) RepeatCheck(packet, type, len, timestamp);
+@@ -1639,10 +1684,31 @@ int LAN::RecvHostPacket(int inst, u8* packet, u64* timestamp)
+     return ret;
+ }
+ 
++bool LAN::MultibootPipeline()
++{
++    bool on = MultibootPipelineEnabled() && MultibootBeaconAt &&
++              (u32)Platform::GetMSCount() - MultibootBeaconAt < kMultibootBeaconHoldMS;
++    if (on != MultibootOn)
++    {
++        MultibootOn = on;
++        Platform::Log(Platform::LogLevel::Info, on
++            ? "LAN: DS Download Play host: MP replies taken as they come, no wait per command\n"
++            : "LAN: DS Download Play host: done, the usual wait for MP replies again\n");
++        if (!on) memset(MPMissCount, 0, sizeof(MPMissCount));
++    }
++    return on;
++}
++
+ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+ {
+     if (!Host) return 0;
+ 
++    const bool pipe = MultibootPipeline();
++    const int savedtimeout = MPRecvTimeout;
++    if (pipe) MPRecvTimeout = 0;
++    const u64 oldest = pipe ? (timestamp > kMultibootReplyWindowUS ? timestamp - kMultibootReplyWindowUS : 0)
++                            : timestamp - 32;
++
+     u16 ret = 0;
+     u16 myinstmask = 1 << MyPlayer.ID;
+     u16 alivemask = 0;                 // players a reply came from (even a late one)
+@@ -1656,6 +1722,7 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+     };
+     auto finish = [&](bool timedout) -> u16
+     {
++        MPRecvTimeout = savedtimeout;
+         landiag::NoteWait(waitstart);
+         if (timedout && landiag::EnvTimeoutMS()) landiag::NReplyTimeout++;
+         if (!timedout && landiag::CmdSentAt && landiag::EnvTimeoutMS())
+@@ -1683,7 +1750,7 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+         {
+             if (i == MyPlayer.ID) continue;
+             if (alivemask & (1 << i)) { MPMissCount[i] = 0; continue; }
+-            if (!timedout || !(waitmask() & (1 << i))) continue;
++            if (!timedout || pipe || !(waitmask() & (1 << i))) continue;
+             if (MPMissCount[i] < 255) MPMissCount[i]++;
+             if (MPMissCount[i] >= kMPMaxMisses)
+                 MPSetActive(i, false, "no reply to 20 MP commands in a row");
+@@ -1692,7 +1759,10 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+     };
+ 
+     if ((myinstmask & waitmask()) == waitmask())
++    {
++        MPRecvTimeout = savedtimeout;
+         return 0;
++    }
+ 
+     for (;;)
+     {
+@@ -1724,7 +1794,7 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+         else
+         {
+             if (header->SenderID < 16) alivemask |= (1 << header->SenderID);
+-            if (header->Timestamp < (timestamp - 32))
++            if (header->Timestamp < oldest)
+                 good = false;
+         }
+ 
+diff --git a/src/net/LAN.h b/src/net/LAN.h
+index f49fa00..631766f 100644
+--- a/src/net/LAN.h
++++ b/src/net/LAN.h
+@@ -176,6 +176,11 @@ private:
+     u8 MPMissCount[16];  // MP commands in a row a MP-active player didn't reply to (RecvReplies timed out)
+     u8 MyMAC[6];         // this console's DS MAC, from the beacons/MP commands it sends (host side)
+     bool MyMACKnown;
++    // BananaDS: DS Download Play host. While we send DS Download Play (multiboot) beacons, RecvReplies takes the
++    // replies that have come in and does not wait for the rest (see LAN.cpp, MultibootPipeline)
++    u32 MultibootBeaconAt = 0;
++    bool MultibootOn = false;
++    bool MultibootPipeline();
+     void MPSetActive(int id, bool on, const char* why);
+     // H: our wifi is on: tell a peer that just joined (it missed the Cmd_PlayerConnect we broadcast as it powered on)
+     void SendWifiStateTo(ENetPeer* peer, int id, const char* why);

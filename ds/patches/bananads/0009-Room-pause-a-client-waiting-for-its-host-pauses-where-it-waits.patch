@@ -1,0 +1,154 @@
+From: Pixelado Dev <350114043+pixeladodev@users.noreply.github.com>
+Subject: [PATCH] Room pause: a client waiting for its host pauses where it waits
+
+A host stopped by a player's menu sends nothing; a client in the middle of a frame waiting for it timed out a few times and then moved its emulated time on a frame at a time until the frame's end (melonDS's host-quiet step): after the pause it was 16-32 ms ahead of the host, its replies outside the CMDs' windows, and both consoles ran at 30 fps for 2-3 s each time the host's menu closed (RG DS host, RG DS Plus, Mario Kart DS). melonDS now asks the frontend (Platform::MP_HoldWait, melonDS patch 0014) when no host frame came: with another player's menu holding the room, the frontend's pause runs right there (Emu::set_hold_wait; the same pause as at a frame's end, the menus and Party's wait screen included) and the emulated time doesn't move.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/bananads/src/emu.cpp b/bananads/src/emu.cpp
+index 38a1cca..2c5cd8d 100644
+--- a/bananads/src/emu.cpp
++++ b/bananads/src/emu.cpp
+@@ -2802,6 +2802,17 @@ std::string Emu::room_hold_names() const {
+     return hold_names_;
+ }
+ 
++bool Emu::mp_hold_wait() {
++#ifdef BANANADS_LAN
++    if (!local_ || hidden_ || !hold_wait_) return false;
++    lan_hold_tick();   // (who holds the room: told at a frame's start, and this is the middle of one)
++    if (hold_others_.load(std::memory_order_acquire) <= 0) return false;
++    return hold_wait_();
++#else
++    return false;
++#endif
++}
++
+ void Emu::net_resumed() {
+ #ifdef BANANADS_LAN
+     std::lock_guard<std::mutex> g(net_mu_);
+diff --git a/bananads/src/emu.h b/bananads/src/emu.h
+index 735cfaa..6107e82 100644
+--- a/bananads/src/emu.h
++++ b/bananads/src/emu.h
+@@ -141,6 +141,11 @@ public:
+     int room_hold_others() const { return hold_others_.load(std::memory_order_acquire); }
+     std::string room_hold_names() const;
+     void net_resumed();
++    // the room's pause in the middle of a frame (melonDS's Platform::MP_HoldWait): a client waiting for its host while
++    // another player's menu holds the room pauses there, the emulated time where it is. The frontend sets the pause
++    // (on the emulator's thread: it returns once the pause is over, true; false: it didn't pause); none, no pause
++    void set_hold_wait(std::function<bool()> f) { hold_wait_ = std::move(f); }
++    bool mp_hold_wait();
+ 
+     // ---- wifi.local from the in-game menu (Quick settings > Local multiplayer) ----
+     // The menu asks from its own thread; the emulator's thread carries it out between two frames or in the paused
+@@ -294,6 +299,7 @@ private:
+     uint16_t hold_mask_ = 0;       // the others holding the room, by LAN player ID (emulator thread)
+     std::string hold_names_;       // their names (lan_mu_)
+     void lan_hold_tick();          // our hold to the room, theirs from it (emulator thread)
++    std::function<bool()> hold_wait_;   // set_hold_wait's
+     std::string wfc_path_;             // wifi.wfc_settings: where the WFC settings are kept ("" off)
+     std::vector<uint8_t> wfc_last_;    // the settings as last loaded or saved (a write that changes nothing: no file)
+     std::mutex net_mu_;  // service_net() against the menu thread's save_state/load_state/restart (LAN Begin/End)
+diff --git a/bananads/src/frontend_kms.cpp b/bananads/src/frontend_kms.cpp
+index c253cfd..a3935a8 100644
+--- a/bananads/src/frontend_kms.cpp
++++ b/bananads/src/frontend_kms.cpp
+@@ -2563,31 +2563,45 @@ int run_kms(Emu& emu, const Config& cfg) {
+         long long ra_t = now_us();
+         bool grid_now = false;   // kms.grid_cpu: the 2D engine draws the grid into the frames
+         bool asked16 = false, on16 = false;   // kms.rgb565: asked of the 2D engine, and in effect
++        // the menu (pause_req), or another player's menu holding the room: paused until it's over (at a frame's end,
++        // or for a client waiting for its host, where it waits: Emu::set_hold_wait)
++        const auto held = [&] {
++            return (pause_req.load() || (menu_on && emu.room_hold_others() > 0)) && run.load() && !g_quit;
++        };
++        const auto room_pause = [&] {
++            const bool ours = pause_req.load(std::memory_order_acquire);
++            emu.service_net();   // (our hold out to the room at once, before the wait)
++            std::unique_lock<std::mutex> l(pm);
++            paused = true;
++            pcv.notify_all();
++            if (!ours) wake();   // the presenter: another player's menu, its screen to show
++            // wifi.local: the LAN link kept alive while paused, and the room's pause followed (every 10 ms: the
++            // consoles start again within a few ms of each other)
++            while (held()) {
++                pcv.wait_for(l, std::chrono::milliseconds(10));
++                if (!held()) break;
++                l.unlock();
++                emu.service_net();
++                l.lock();
++            }
++            paused = false;
++            l.unlock();
++            emu.net_resumed();
++            aim = 0;  // (kms.lowlat: aimed again from now, not from before the menu)
++        };
++        // A client waits for its host in the middle of a frame; a host stopped by a player's menu sends nothing, and
++        // after a few receive timeouts the client moved its emulated time on by a frame at a time until the frame's
++        // end (16-32 ms): after the pause it was that far ahead of the host, its replies outside the CMDs' windows,
++        // and both consoles ran at 30 fps for 2-3 s. It pauses where it waits instead
++        emu.set_hold_wait([&] {
++            if (!menu_on || !held()) return false;
++            Log(LogLevel::Info, "[kms] the room paused by another player's menu while waiting for the host: paused there\n");
++            room_pause();
++            return true;
++        });
+         while (run.load(std::memory_order_relaxed) && !g_quit && !emu.stopped()) {
+-            // the menu (pause_req), or another player's menu holding the room: at a frame's end, until it's over
+             if (pause_req.load(std::memory_order_acquire) || (menu_on && emu.room_hold_others() > 0)) {
+-                const bool ours = pause_req.load(std::memory_order_acquire);
+-                emu.service_net();   // (our hold out to the room at once, before the wait)
+-                std::unique_lock<std::mutex> l(pm);
+-                paused = true;
+-                pcv.notify_all();
+-                if (!ours) wake();   // the presenter: another player's menu, its screen to show
+-                const auto held = [&] {
+-                    return (pause_req.load() || (menu_on && emu.room_hold_others() > 0)) && run.load() && !g_quit;
+-                };
+-                // wifi.local: the LAN link kept alive while paused, and the room's pause followed (every 10 ms: the
+-                // consoles start again within a few ms of each other)
+-                while (held()) {
+-                    pcv.wait_for(l, std::chrono::milliseconds(10));
+-                    if (!held()) break;
+-                    l.unlock();
+-                    emu.service_net();
+-                    l.lock();
+-                }
+-                paused = false;
+-                l.unlock();
+-                emu.net_resumed();
+-                aim = 0;  // (kms.lowlat: aimed again from now, not from before the menu)
++                room_pause();
+                 continue;
+             }
+             {
+@@ -2823,6 +2837,7 @@ int run_kms(Emu& emu, const Config& cfg) {
+                 emu.diag_sleep(now_us() - sl0);
+             }
+         }
++        emu.set_hold_wait(nullptr);   // (its pause is this thread's, and ends with it)
+         if (pl_moves) Log(LogLevel::Info, "[kms] pace phase: the frames' schedule moved %ld times\n", pl_moves);
+         run = false;
+         pcv.notify_all();
+diff --git a/bananads/src/platform.cpp b/bananads/src/platform.cpp
+index 9534450..fefcb2e 100644
+--- a/bananads/src/platform.cpp
++++ b/bananads/src/platform.cpp
+@@ -228,6 +228,7 @@ int MP_SendReply(u8* d, int l, u64 ts, u16 aid, void* u) { return mp_hidden(u) ?
+ int MP_SendAck(u8* d, int l, u64 ts, void* u) { return mp_hidden(u) ? l : MPInterface::Get().SendAck(0, d, l, ts); }
+ int MP_RecvHostPacket(u8* d, u64* ts, void* u) { return mp_hidden(u) ? 0 : MPInterface::Get().RecvHostPacket(0, d, ts); }
+ u16 MP_RecvReplies(u8* d, u64 ts, u16 m, void* u) { return mp_hidden(u) ? 0 : MPInterface::Get().RecvReplies(0, d, ts, m); }
++bool MP_HoldWait(void* u) { return u && Emu::from(u)->mp_hold_wait(); }
+ #else
+ void MP_Begin(void*) {}
+ void MP_End(void*) {}
+@@ -238,6 +239,7 @@ int MP_SendReply(u8*, int len, u64, u16, void*) { return len; }
+ int MP_SendAck(u8*, int len, u64, void*) { return len; }
+ int MP_RecvHostPacket(u8*, u64*, void*) { return 0; }
+ u16 MP_RecvReplies(u8*, u64, u16, void*) { return 0; }
++bool MP_HoldWait(void*) { return false; }
+ #endif
+ 
+ // --- internet (Nintendo WFC revivals) ---

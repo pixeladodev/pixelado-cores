@@ -1,0 +1,9 @@
+# macOS
+.DS_Store
+._*
+# build
+/ds/.cache/
+/ds/dist/
+# Python
+__pycache__/
+*.py[cod]

@@ -1,0 +1,47 @@
+From: Pixelado Dev <350114043+pixeladodev@users.noreply.github.com>
+Subject: [PATCH] LAN: the ACK sent again goes in one datagram with the CMD
+
+As a host, each CMD is preceded by the previous exchange's ACK sent again (0010, so a client that missed it isn't
+left waiting). It went out as its own datagram: one sendto and one radio frame more per exchange (Mario Party DS:
+~230 a second). Now it is queued in ENet without a flush, and the CMD's flush sends both in one datagram; the
+client gets them in the same order as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/net/LAN.cpp b/src/net/LAN.cpp
+index 6fbc4fb..0a8a460 100644
+--- a/src/net/LAN.cpp
++++ b/src/net/LAN.cpp
+@@ -1716,7 +1716,7 @@ void LAN::SendNow(u32 type, const u8* packet, int len, u64 timestamp)
+         enet_peer_send(LastHostPeer, Chan_MP, enetpacket);
+     else
+         enet_host_broadcast(Host, Chan_MP, enetpacket);
+-    enet_host_flush(Host);
++    if (!HoldFlush) enet_host_flush(Host);
+ }
+ 
+ int LAN::RecvPacketGeneric(u8* packet, bool block, u64* timestamp)
+@@ -1912,7 +1912,11 @@ void LAN::ResendAck(u64 cmdts)
+ {
+     // only the ACK of the exchange just before this CMD (emulated time restarts with each game)
+     if (!LastAckValid || LastAck.empty() || LastAckTS >= cmdts || cmdts - LastAckTS > 100000) return;
++    // Pixelado 0012: not sent on its own: queued in ENet and sent with the CMD that follows, in one datagram (one
++    // sendto and one radio frame less per exchange; the client gets both, in this order, as before)
++    HoldFlush = true;
+     SendPacketGeneric(3, LastAck.data(), (int)LastAck.size(), LastAckTS);
++    HoldFlush = false;
+     mprec::NResendAck++;
+ }
+ 
+diff --git a/src/net/LAN.h b/src/net/LAN.h
+index 41a47a9..bc8ecd1 100644
+--- a/src/net/LAN.h
++++ b/src/net/LAN.h
+@@ -226,6 +226,7 @@ private:
+     void SendNow(u32 type, const u8* packet, int len, u64 timestamp);
+     void FlushDelayed();
+     int ServiceDelayed(ENetEvent* event, int timeout);
++    bool HoldFlush = false;   // Pixelado 0012: SendNow queues without flushing (the ACK sent again goes with the next CMD)
+ 
+     u32 FrameCount;
+ 

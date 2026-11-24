@@ -1,0 +1,281 @@
+From: Pixelado Dev <350114043+pixeladodev@users.noreply.github.com>
+Subject: [PATCH] Wifi: the lazy timer (idle ticks folded into the next event)
+
+BANANADS_WIFI_LAZY=1 (0 or unset: off): with the transceiver on, USTimer runs every 8 us, 125 000 events a second,
+each one ending the CPUs' run. After a tick, the ticks that follow it and would only count (no TX or RX under way;
+no CheckRX, MSTimer, pre-beacon IRQ or MP client sync on them; at most 63) are folded into the next event, which
+fires at the time the first tick that does something has, and applies the folded ones first. A register read or
+write, POWCNT2 and a savestate apply the folded ticks due by then and put the timer back to every tick, so what
+the game sees is what every tick gives. BANANADS_WIFI_LAZY_AB_S=<s>: on and off in turns, to compare; "[diag]
+wifi lazy" counts events, folded ticks and catch-ups a second.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/Wifi.cpp b/src/Wifi.cpp
+index 2bdbce3..b56e49f 100644
+--- a/src/Wifi.cpp
++++ b/src/Wifi.cpp
+@@ -19,6 +19,8 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <stdlib.h>
++#include <ctime>
++#include <algorithm>
+ #include "NDS.h"
+ #include "SPI.h"
+ #include "Wifi.h"
+@@ -607,6 +609,7 @@ Wifi::~Wifi()
+ 
+ void Wifi::Reset()
+ {
++    LazyN = LazyDone = 0;   // (Pixelado 0013)
+     memset(RAM, 0, 0x2000);
+     memset(IO, 0, 0x1000);
+ 
+@@ -746,6 +749,10 @@ void Wifi::Reset()
+ 
+ void Wifi::DoSavestate(Savestate* file)
+ {
++    // Pixelado 0013: a state never holds folded ticks: saved with the timer at every tick, loaded with none pending
++    if (file->Saving) LazyCatchUp(NDS.ARM7Timestamp);
++    else LazyN = LazyDone = 0;
++
+     file->Section("WIFI");
+ 
+     // berp.
+@@ -824,6 +831,139 @@ void Wifi::DoSavestate(Savestate* file)
+ }
+ 
+ 
++// Pixelado 0013, the lazy timer (BANANADS_WIFI_LAZY=1; 0 or unset: off): with the transceiver on, USTimer runs every
++// 8 us of emulated time, 125 000 events a second, each one ending the CPUs' run (Mario Party DS in multiplayer: ~1 ms of
++// a frame between the event, the scheduler and the JIT's shorter runs). Most of those ticks only count: no TX or RX
++// under way, the counters (USTimestamp, USCounter, CmdCounter, W_CONTENTFREE, RXCounter) step on, and nothing is
++// checked or raised. So, after a tick, the idle ticks that follow it (until the first one that would do anything:
++// a CheckRX, a millisecond's MSTimer, the beacon's pre-IRQ, a MP client's sync, at most kLazyMax) are folded into the
++// next event, scheduled at the time the first non-idle tick has; when it fires the folded ones are applied first.
++// Anything that looks at the wifi in between (a register read or write, POWCNT2, a savestate) applies the folded
++// ticks due by then (LazyCatchUp) and puts the timer back to the next tick: what it sees and what follows are the
++// same as with every tick. BANANADS_WIFI_LAZY_AB_S=<s>: on and off in turns of that many seconds of the wall clock
++// (on in the even ones), "[diag] wifi lazy" says each change and a line a second counts it.
++namespace lazy
++{
++static int Mode()
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        const char* e = getenv("BANANADS_WIFI_LAZY");
++        v = (e && e[0] == '1') ? 1 : 0;
++        Log(LogLevel::Info, "wifi: lazy timer %s\n", v ? "on (BANANADS_WIFI_LAZY=1)" : "off");
++    }
++    return v;
++}
++static int ABS()
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        const char* e = getenv("BANANADS_WIFI_LAZY_AB_S");
++        v = (e && *e) ? std::clamp(atoi(e), 0, 3600) : 0;
++        if (v && Mode()) Log(LogLevel::Info, "wifi: lazy timer on and off in turns of %d s (A/B)\n", v);
++    }
++    return v;
++}
++static int Last = -1;
++static u64 NEvents, NFolded, NCatch, NCatchTicks;
++static u64 StatAt;
++static bool On()
++{
++    if (!Mode()) return false;
++    int on = 1;
++    if (ABS()) on = ((time(nullptr) / ABS()) % 2) == 0;
++    if (on != Last)
++    {
++        Log(LogLevel::Info, "[diag] wifi lazy: %s\n", on ? "on" : "off");
++        Last = on;
++    }
++    return on;
++}
++static void Stat()
++{
++    const u64 now = Platform::GetMSCount();
++    if (!StatAt) StatAt = now;
++    if (now - StatAt < 1000) return;
++    if (Mode())
++        Log(LogLevel::Info, "[diag] wifi lazy: %s, events %llu, ticks folded %llu, catch-ups %llu (%llu ticks)\n",
++            Last > 0 ? "on" : "off", (unsigned long long)NEvents, (unsigned long long)NFolded,
++            (unsigned long long)NCatch, (unsigned long long)NCatchTicks);
++    NEvents = NFolded = NCatch = NCatchTicks = 0;
++    StatAt = now;
++}
++static s32 NextDelay(s32& err)
++{
++    s32 cycles = 33513982 * 8;   // (kTimerInterval)
++    cycles -= err;
++    s32 delay = (cycles + 999999) / 1000000;
++    err = (delay * 1000000) - cycles;
++    return delay;
++}
++}
++
++// How many ticks after this one would only count (0 or 1: not worth folding)
++int Wifi::LazyPlan()
++{
++    if (!PowerOn || USUntilPowerOn < 0 || ComStatus != 0 || IOPORT(W_TXBusy) != 0) return 0;
++    const bool uscount = IOPORT(W_USCountCnt) != 0;
++    const bool uscompare = uscount && IOPORT(W_USCompareCnt) != 0;
++    const u32 prebeacon = IOPORT(W_PreBeacon) & kTimeCheckMask;
++    const u32 bc1 = IOPORT(W_BeaconCount1);
++    int n = 0;
++    for (int i = 1; i <= kLazyMax; i++)
++    {
++        const u64 u = USTimestamp + (u64)kTimerInterval * i;
++        const u32 r = RXCounter + kTimerInterval * (i - 1);
++        if (IsMPClient && ((RXTimestamp && u >= RXTimestamp) || u >= NextSync)) break;
++        if (!(u & 0x3FF & kTimeCheckMask)) break;
++        if (uscount)
++        {
++            const u32 uspart = (u32)((USCounter + (u64)kTimerInterval * i) & 0x3FF);
++            if (!(uspart & kTimeCheckMask)) break;
++            if (uscompare && ((((bc1 << 10) | (0x3FF - uspart)) & kTimeCheckMask) == prebeacon)) break;
++        }
++        if (((!IsMPClient) || (u > NextSync)) && !(r & 0x1FF & kTimeCheckMask)) break;
++        n = i;
++    }
++    return n == kLazyMax ? kLazyMax - 1 : n;   // (the last one stays the event)
++}
++
++// one folded tick: what USTimer does on an idle one
++void Wifi::LazyTick()
++{
++    USTimestamp += kTimerInterval;
++    if (IOPORT(W_USCountCnt)) USCounter += kTimerInterval;
++    if ((IOPORT(W_CmdCountCnt) & 0x0001) && CmdCounter > 0)
++        CmdCounter = CmdCounter < (u32)kTimerInterval ? 0 : CmdCounter - kTimerInterval;
++    if (IOPORT(W_ContentFree) != 0)
++        IOPORT(W_ContentFree) = IOPORT(W_ContentFree) < kTimerInterval ? 0 : IOPORT(W_ContentFree) - kTimerInterval;
++    RXCounter += kTimerInterval;
++}
++
++void Wifi::LazyCatchUp(u64 now)
++{
++    if (!LazyN) return;
++    lazy::NCatch++;
++    while (LazyDone < LazyN && LazyTS[LazyDone] <= now)
++    {
++        LazyTick();
++        LazyDone++;
++        lazy::NCatchTicks++;
++    }
++    if (LazyDone < LazyN)
++    {
++        // the next folded tick becomes the event again, with the TimerError it had
++        const u64 prev = LazyDone ? LazyTS[LazyDone - 1] : LazyBase;
++        NDS.CancelEvent(Event_Wifi);
++        NDS.SchedList[Event_Wifi].Timestamp = prev;
++        TimerError = LazyErr[LazyDone];
++        NDS.ScheduleEvent(Event_Wifi, true, (s32)(LazyTS[LazyDone] - prev), 0, 0);
++    }
++    LazyN = LazyDone = 0;
++}
++
+ void Wifi::ScheduleTimer(bool first)
+ {
+     if (first) TimerError = 0;
+@@ -891,6 +1031,7 @@ void Wifi::UpdatePowerOn()
+ 
+ void Wifi::SetPowerCnt(u32 val)
+ {
++    if (LazyN) LazyCatchUp(NDS.ARM7Timestamp);   // (Pixelado 0013)
+     Enabled = val & (1<<1);
+     UpdatePowerOn();
+ }
+@@ -2523,6 +2664,15 @@ void Wifi::MSTimer()
+ 
+ void Wifi::USTimer(u32 param)
+ {
++    // Pixelado 0013: the idle ticks folded into this event first
++    if (LazyN)
++    {
++        while (LazyDone < LazyN) { LazyTick(); LazyDone++; }
++        LazyN = LazyDone = 0;
++    }
++    lazy::NEvents++;
++    if (lazy::Mode()) lazy::Stat();
++
+     USTimestamp += kTimerInterval;
+ 
+     {
+@@ -2738,6 +2888,31 @@ void Wifi::USTimer(u32 param)
+         }
+     }
+ 
++    // Pixelado 0013: the idle ticks that follow, folded into the next event
++    if (lazy::On())
++    {
++        const int n = LazyPlan();
++        if (n >= 2)
++        {
++            const u64 base = NDS.SchedList[Event_Wifi].Timestamp;
++            u64 ts = base;
++            s32 err = TimerError;
++            for (int i = 0; i < n; i++)
++            {
++                ts += lazy::NextDelay(err);
++                LazyTS[i] = ts;
++                LazyErr[i] = err;
++            }
++            const s32 last = lazy::NextDelay(err);
++            LazyBase = base;
++            LazyN = n;
++            LazyDone = 0;
++            TimerError = err;
++            lazy::NFolded += n;
++            NDS.ScheduleEvent(Event_Wifi, true, (s32)(ts + last - base), 0, 0);
++            return;
++        }
++    }
+     ScheduleTimer(false);
+ }
+ 
+@@ -2811,6 +2986,8 @@ u16 Wifi::Read(u32 addr)
+ 
+     addr &= 0x7FFE;
+ 
++    if (LazyN && !(addr >= 0x4000 && addr < 0x6000)) LazyCatchUp(NDS.ARM7Timestamp);   // (Pixelado 0013)
++
+     if (addr >= 0x4000 && addr < 0x6000)
+     {
+         return *(u16*)&RAM[addr & 0x1FFE];
+@@ -2914,6 +3091,8 @@ void Wifi::Write(u32 addr, u16 val)
+ 
+     addr &= 0x7FFE;
+ 
++    if (LazyN && !(addr >= 0x4000 && addr < 0x6000)) LazyCatchUp(NDS.ARM7Timestamp);   // (Pixelado 0013)
++
+     if (addr >= 0x4000 && addr < 0x6000)
+     {
+         rdiag::RamWrite(addr & 0x1FFE);
+diff --git a/src/Wifi.h b/src/Wifi.h
+index 6476bbf..6987d6c 100644
+--- a/src/Wifi.h
++++ b/src/Wifi.h
+@@ -263,6 +263,17 @@ private:
+     class WifiAP* WifiAP;
+ 
+     void ScheduleTimer(bool first);
++    // Pixelado 0013, the lazy timer (see Wifi.cpp)
++    static const int kLazyMax = 64;
++    int LazyN = 0, LazyDone = 0;          // idle ticks folded into the next event; how many a catch-up applied
++    u64 LazyBase = 0;                     // the timestamp of the tick that folded them
++    u64 LazyTS[kLazyMax];                 // each folded tick's timestamp
++    s32 LazyErr[kLazyMax];                // TimerError after that tick's delay
++    int LazyPlan();
++    void LazyTick();
++public:
++    void LazyCatchUp(u64 now);            // (the folded ticks up to now applied, the timer back to every tick)
++private:
+     void UpdatePowerOn();
+ 
+     void CheckIRQ(u16 oldflags);

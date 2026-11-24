@@ -1,0 +1,42 @@
+From: Pixelado Dev <350114043+pixeladodev@users.noreply.github.com>
+Subject: [PATCH] Wifi: the room's pause, a client waiting for its host pauses there
+
+A MP client whose host frame doesn't come (MP_RecvHostPacket timed out) asks the frontend first (Platform::MP_HoldWait, Pixelado): when another player's menu holds the room, the frontend pauses right there until the pause is over, and no host-quiet step moves the emulated time on. Those steps ran the client 16-32 ms ahead of a host that had stopped at its frame's end; after the pause its replies missed the CMDs' windows and both consoles ran at 30 fps for 2-3 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/Platform.h b/src/Platform.h
+index dd93076..31ea970 100644
+--- a/src/Platform.h
++++ b/src/Platform.h
+@@ -309,6 +309,10 @@ int MP_SendReply(u8* data, int len, u64 timestamp, u16 aid, void* userdata);
+ int MP_SendAck(u8* data, int len, u64 timestamp, void* userdata);
+ int MP_RecvHostPacket(u8* data, u64* timestamp, void* userdata);
+ u16 MP_RecvReplies(u8* data, u64 timestamp, u16 aidmask, void* userdata);
++// Pixelado: a MP client found no host frame (MP_RecvHostPacket timed out). If the frontend's room is paused by
++// another player's menu (the host stopped on purpose), it pauses right here, in the middle of the frame, until the
++// pause is over, and returns true: the emulated time hasn't moved. false: no pause (the usual wait goes on).
++bool MP_HoldWait(void* userdata);
+ 
+ 
+ // network comm interface
+diff --git a/src/Wifi.cpp b/src/Wifi.cpp
+index b56e49f..5d3e3e2 100644
+--- a/src/Wifi.cpp
++++ b/src/Wifi.cpp
+@@ -2378,6 +2378,15 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
+                 IsMP = false;
+                 IsMPClient = false;
+             }
++            else if (rxlen == 0 && IsMPClient && Platform::MP_HoldWait(NDS.UserData))
++            {
++                // Pixelado: the room's pause (a player's menu) while we waited for the host: paused here, so no
++                // host-quiet step below moved the emulated time on. Those steps (a frame of 16 ms each, after a few
++                // timeouts) ran this client one or two frames ahead of a host that had stopped at its frame's end,
++                // and after the pause each CMD found this client's reply out of its window: the game sent its CMDs
++                // again and again, both consoles at 30 fps for 2-3 s (RG DS host, RG DS Plus client, Mario Kart DS)
++                HostQuietCount = 0;
++            }
+             else if (rxlen == 0 && IsMPClient)
+             {
+                 if (cdiag::On() && hold::NWaitLogs < 400)

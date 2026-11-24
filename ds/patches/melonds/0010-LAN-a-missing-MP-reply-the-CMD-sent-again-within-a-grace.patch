@@ -1,0 +1,489 @@
+From: Pixelado Dev <350114043+pixeladodev@users.noreply.github.com>
+Subject: [PATCH] LAN: a missing MP reply, the CMD sent again within a grace (a radio gap is a stall, not a lost exchange)
+
+
+---
+diff --git a/src/Wifi.cpp b/src/Wifi.cpp
+index 8d6d8fc..2bdbce3 100644
+--- a/src/Wifi.cpp
++++ b/src/Wifi.cpp
+@@ -89,6 +89,26 @@ bool MACIsBroadcast(const u8* a)
+     return (*(u32*)&a[0] == 0xFFFFFFFF) && (*(u16*)&a[4] == 0xFFFF);
+ }
+ 
++// Pixelado: while the host waits out a radio gap and sends its CMD again (LAN.cpp, mprec: up to
++// BANANADS_LAN_GRACE_MS), a client doesn't run on without it: the step past a quiet host waits for the grace
++// plus 100 ms. With the grace off (0), the step comes after kHostQuietTries timeouts, as before.
++static u64 HostQuietStepMS()
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        v = 300;
++        const char* e = getenv("BANANADS_LAN_GRACE_MS");
++        if (e && *e)
++        {
++            char* end = nullptr;
++            long n = strtol(e, &end, 10);
++            if (end && *end == 0 && n >= 0 && n <= 2000) v = (int)n;
++        }
++    }
++    return v ? (u64)v + 100 : 0;
++}
++
+ // BananaDS diagnostics: Debug level (BananaDS log.level 0), "[diag]" prefix, each category at most N lines a second
+ // (the lines held back are counted and reported with the category's next line)
+ // BananaDS respuesta-temprana (on by default; BANANADS_LAN_EARLY_REPLY=0 turns it off): as a MP client, the reply to the host's
+@@ -2249,7 +2269,7 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
+                     RXTimestamp = 0;
+                     HostQuietCount = 0;
+                 }
+-                else if (HostQuietCount > kHostQuietTries)
++                else if (HostQuietCount > kHostQuietTries && now - HostQuietSince >= HostQuietStepMS())
+                     NextSync = USTimestamp + kHostQuietStepUS;
+             }
+             if (rxlen > 0) HostQuietCount = 0;
+diff --git a/src/net/LAN.cpp b/src/net/LAN.cpp
+index a6d8066..6fbc4fb 100644
+--- a/src/net/LAN.cpp
++++ b/src/net/LAN.cpp
+@@ -108,6 +108,67 @@ static bool IsMultibootBeacon(const u8* packet, int len)
+ }
+ 
+ // BananaDS diagnostics: Debug level (BananaDS log.level 0), "[diag] LAN" prefix, rate-limited
++// Pixelado: lossless MP over a radio that sometimes goes quiet. Real DS hardware sends a CMD again while a
++// client's reply is missing; melonDS reports the client as failed at once (Wifi.cpp keeps that retry off), so
++// a game sees each late or lost packet. Most games shrug it off, but some (Mario Party DS) can end up in a
++// state their link never leaves: the picture stops while both sides keep talking. So, as the host: when the
++// replies are missing, wait up to the grace (BANANADS_LAN_GRACE_MS, default 300, 0 = off: the plain
++// MPRecvTimeout) and send the CMD again every BANANADS_LAN_RESEND_MS (default 20); as a client: a CMD that
++// comes in again (same timestamp) gets our reply to it again and is not handed to the DS twice. A radio gap
++// costs a stall, not an exchange. Grace only for players that replied lately (fewer than kGraceMisses CMDs in
++// a row missed), so a console that left costs one grace and then the usual timeout.
++// BANANADS_LAN_DROP (test only, 0-500 per mille, default 0) drops that share of the MP frames we send.
++// BANANADS_LAN_DELAY_MS (test only, 0-200, default 0) delays the MP frames we send like a weak radio: in stretches
++// of half a second, BANANADS_LAN_DELAY_BAD per cent of them (default 10) are bad (each frame 0 to that many ms late)
++// and the rest good (0-1 ms); frames keep their order. Nothing is lost.
++// A line a second when any of it happened: "[diag] LAN recovery".
++namespace mprec
++{
++const int kGraceMisses = 3;
++static int EnvInt(const char* name, int def, int lo, int hi)
++{
++    const char* e = getenv(name);
++    if (!e || !*e) return def;
++    char* end = nullptr;
++    long n = strtol(e, &end, 10);
++    if (end && *end == 0 && n >= lo && n <= hi) return (int)n;
++    Platform::Log(Platform::LogLevel::Warn, "LAN: %s=%s ignored (%d-%d)\n", name, e, lo, hi);
++    return def;
++}
++static int GraceMS() { static int v = -1; if (v < 0) v = EnvInt("BANANADS_LAN_GRACE_MS", 300, 0, 2000); return v; }
++static int ResendMS() { static int v = -1; if (v < 0) v = EnvInt("BANANADS_LAN_RESEND_MS", 20, 5, 200); return v; }
++static int DropPermille() { static int v = -1; if (v < 0) v = EnvInt("BANANADS_LAN_DROP", 0, 0, 500); return v; }
++static bool Drop()
++{
++    if (!DropPermille()) return false;
++    static u32 x = 0;
++    if (!x) x = (u32)Platform::GetUSCount() | 1;
++    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
++    return (x % 1000) < (u32)DropPermille();
++}
++static u32 Rand()
++{
++    static u32 x = 0;
++    if (!x) x = (u32)Platform::GetUSCount() | 1;
++    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
++    return x;
++}
++static int DelayMS() { static int v = -1; if (v < 0) v = EnvInt("BANANADS_LAN_DELAY_MS", 0, 0, 200); return v; }
++static int DelayBadPct() { static int v = -1; if (v < 0) v = EnvInt("BANANADS_LAN_DELAY_BAD", 10, 0, 100); return v; }
++static u64 DelaySegUntil;
++static bool DelayBad;
++static u64 DelayUS()   // how late this frame goes out
++{
++    const u64 now = Platform::GetUSCount();
++    if (now >= DelaySegUntil) { DelayBad = (int)(Rand() % 100) < DelayBadPct(); DelaySegUntil = now + 500000; }
++    const u64 max = (u64)DelayMS() * 1000;
++    if (!DelayBad) return Rand() % 1001;
++    return Rand() % (max + 1);
++}
++static int NResendCmd, NDupCmd, NResendReply, NSaved, NGraceOut, NDropped, NResendAck, NDupAck, NNoAck, NDelayed;
++static u64 SavedMaxUS, DelayedSumUS;
++}
++
+ namespace landiag
+ {
+ struct Rate { u64 Start; int N; int Held; };
+@@ -289,6 +350,14 @@ LAN::LAN() noexcept : Inited(false)
+     if (landiag::EnvTimeoutMS()) MPRecvTimeout = landiag::EnvTimeoutMS();
+     Platform::Log(Platform::LogLevel::Info, "LAN: MP receive timeout %d ms (%s)\n", MPRecvTimeout,
+         landiag::EnvTimeoutMS() ? "BANANADS_LAN_TIMEOUT_MS" : "default");
++    if (mprec::GraceMS())
++        Platform::Log(Platform::LogLevel::Info, "LAN: MP replies missing: the CMD again every %d ms, up to %d ms (BANANADS_LAN_GRACE_MS)%s\n",
++            mprec::ResendMS(), mprec::GraceMS(), mprec::DropPermille() ? "; test: dropping MP frames (BANANADS_LAN_DROP)" : "");
++    else
++        Platform::Log(Platform::LogLevel::Info, "LAN: MP replies missing: given up after the timeout (BANANADS_LAN_GRACE_MS=0)\n");
++    if (mprec::DelayMS())
++        Platform::Log(Platform::LogLevel::Info, "LAN: test: MP frames delayed like a weak radio, up to %d ms in %d%% of the time (BANANADS_LAN_DELAY_MS, _BAD)\n",
++            mprec::DelayMS(), mprec::DelayBadPct());
+     LastHostID = -1;
+     LastHostPeer = nullptr;
+ 
+@@ -1253,6 +1322,7 @@ void LAN::ProcessEvent(ENetEvent& event)
+ void LAN::ProcessLAN(int type)
+ {
+     if (!Host) return;
++    if (!DelayQueue.empty()) FlushDelayed();
+ 
+     u32 time_last = (u32)Platform::GetMSCount();
+ 
+@@ -1293,7 +1363,7 @@ void LAN::ProcessLAN(int type)
+     time_last = (u32)Platform::GetMSCount();
+ 
+     ENetEvent event;
+-    while (enet_host_service(Host, &event, timeout) > 0)
++    while (ServiceDelayed(&event, timeout) > 0)
+     {
+         if (event.type == ENET_EVENT_TYPE_RECEIVE && event.channelID == Chan_MP)
+         {
+@@ -1307,7 +1377,12 @@ void LAN::ProcessLAN(int type)
+             else if (header->SenderID == MyPlayer.ID)
+                 good = false;
+ 
+-            if (!good)
++            if (good) event.packet->userData = event.peer;
++            if (good && TakeDuplicateCmd(event.packet))
++            {
++                // a CMD we already took: answered again (TakeDuplicateCmd), not queued
++            }
++            else if (!good)
+             {
+                 enet_packet_destroy(event.packet);
+             }
+@@ -1404,6 +1479,17 @@ void LAN::Process()
+                 }
+                 if (pn) Platform::Log(Platform::LogLevel::Info, "[diag] LAN enet:%s\n", pb);
+             }
++            if (mprec::NResendCmd || mprec::NDupCmd || mprec::NResendReply || mprec::NSaved || mprec::NGraceOut || mprec::NDropped || mprec::NDupAck || mprec::NNoAck || mprec::NDelayed)
++                Platform::Log(Platform::LogLevel::Info,
++                    "[diag] LAN recovery: CMDs sent again %d, ACKs sent again %d, waits saved %d (longest %.1f ms), given up after the grace %d; "
++                    "as a client: CMDs again %d, replies sent again %d, ACKs again %d, exchanges without their ACK %d; dropped on purpose %d; delayed on purpose %d (%.1f ms on average)\n",
++                    mprec::NResendCmd, mprec::NResendAck, mprec::NSaved, mprec::SavedMaxUS / 1000.0, mprec::NGraceOut,
++                    mprec::NDupCmd, mprec::NResendReply, mprec::NDupAck, mprec::NNoAck, mprec::NDropped,
++                    mprec::NDelayed, mprec::NDelayed ? mprec::DelayedSumUS / 1000.0 / mprec::NDelayed : 0.0);
++            mprec::NResendCmd = mprec::NDupCmd = mprec::NResendReply = mprec::NSaved = mprec::NGraceOut = mprec::NDropped = 0;
++            mprec::NResendAck = mprec::NDupAck = mprec::NNoAck = mprec::NDelayed = 0;
++            mprec::DelayedSumUS = 0;
++            mprec::SavedMaxUS = 0;
+             landiag::WaitUS = landiag::WaitMaxUS = 0;
+             landiag::NWaits = landiag::NReplyTimeout = 0;
+             landiag::SReply.Reset(); landiag::SRtt.Reset(); landiag::SPre.Reset(); landiag::SRun.Reset(); landiag::SEmu.Reset();
+@@ -1555,6 +1641,61 @@ int LAN::SendPacketGeneric(u32 type, u8* packet, int len, u64 timestamp)
+ 
+     if (!Repeating) RepeatCheck(packet, type, len, timestamp);
+ 
++    if (((type & 0xFFFF) >= 1 && (type & 0xFFFF) <= 3) && mprec::Drop())
++    {
++        mprec::NDropped++;
++        return len;
++    }
++
++    if (((type & 0xFFFF) >= 1 && (type & 0xFFFF) <= 3) && mprec::DelayMS())
++    {
++        const u64 now = Platform::GetUSCount();
++        u64 at = std::max(now + mprec::DelayUS(), DelayLastAt);
++        DelayLastAt = at;
++        mprec::NDelayed++;
++        mprec::DelayedSumUS += at - now;
++        DelayQueue.push(Delayed{at, type, packet && len > 0 ? std::vector<u8>(packet, packet + len) : std::vector<u8>(), timestamp});
++        FlushDelayed();
++        return len;
++    }
++
++    SendNow(type, packet, len, timestamp);
++    return len;
++}
++
++// enet_host_service, but a blocking wait doesn't hold the test delay's frames back past their time: it waits in
++// slices up to the next one due and sends each as it comes due
++int LAN::ServiceDelayed(ENetEvent* event, int timeout)
++{
++    if (DelayQueue.empty()) return enet_host_service(Host, event, timeout);
++    const u32 start = (u32)Platform::GetMSCount();
++    for (;;)
++    {
++        FlushDelayed();
++        const int left = timeout - (int)((u32)Platform::GetMSCount() - start);
++        if (DelayQueue.empty() || left <= 0) return enet_host_service(Host, event, std::max(0, left));
++        const u64 nowus = Platform::GetUSCount();
++        const u64 due = DelayQueue.front().At;
++        int slice = due > nowus ? (int)((due - nowus + 999) / 1000) : 0;
++        if (slice > left) slice = left;
++        const int r = enet_host_service(Host, event, (enet_uint32)slice);
++        if (r != 0) return r;
++    }
++}
++
++void LAN::FlushDelayed()
++{
++    const u64 now = Platform::GetUSCount();
++    while (!DelayQueue.empty() && DelayQueue.front().At <= now)
++    {
++        Delayed& d = DelayQueue.front();
++        SendNow(d.Type, d.Data.empty() ? nullptr : d.Data.data(), (int)d.Data.size(), d.TS);
++        DelayQueue.pop();
++    }
++}
++
++void LAN::SendNow(u32 type, const u8* packet, int len, u64 timestamp)
++{
+     // TODO make the reliable part optional?
+     //u32 flags = ENET_PACKET_FLAG_RELIABLE;
+     u32 flags = ENET_PACKET_FLAG_UNSEQUENCED;
+@@ -1576,20 +1717,50 @@ int LAN::SendPacketGeneric(u32 type, u8* packet, int len, u64 timestamp)
+     else
+         enet_host_broadcast(Host, Chan_MP, enetpacket);
+     enet_host_flush(Host);
+-
+-    return len;
+ }
+ 
+ int LAN::RecvPacketGeneric(u8* packet, bool block, u64* timestamp)
+ {
+     if (!Host) return 0;
+ 
+-    ProcessLAN(block ? 2 : 1);
+-    if (RXQueue.empty()) return 0;
++    ENetPacket* enetpacket;
++    MPPacketHeader* header;
++    for (;;)
++    {
++        ProcessLAN(block ? 2 : 1);
++        if (RXQueue.empty()) return 0;
+ 
+-    ENetPacket* enetpacket = RXQueue.front();
+-    RXQueue.pop();
+-    MPPacketHeader* header = (MPPacketHeader*)&enetpacket->data[0];
++        enetpacket = RXQueue.front();
++        RXQueue.pop();
++        header = (MPPacketHeader*)&enetpacket->data[0];
++        if (mprec::GraceMS() && (header->Type & 0xFFFF) == 1)
++        {
++            // Pixelado (mprec): a CMD is handed to the DS once; a copy of it that was queued already is dropped
++            if (SeenCmdValid && header->Timestamp == SeenCmdTS)
++            {
++                mprec::NDupCmd++;
++                enet_packet_destroy(enetpacket);
++                continue;
++            }
++            // the exchange before this CMD ended without its ACK reaching us (counted; 0 is what we want)
++            if (SeenCmdValid && header->Timestamp > SeenCmdTS && (!SeenAckValid || SeenAckTS < SeenCmdTS)) mprec::NNoAck++;
++            SeenCmdTS = header->Timestamp;
++            SeenCmdValid = true;
++        }
++        else if (mprec::GraceMS() && (header->Type & 0xFFFF) == 3)
++        {
++            // an ACK once: a copy, or one older than the CMD already taken (it ends an exchange that is over)
++            if ((SeenAckValid && header->Timestamp == SeenAckTS) || (SeenCmdValid && header->Timestamp < SeenCmdTS))
++            {
++                mprec::NDupAck++;
++                enet_packet_destroy(enetpacket);
++                continue;
++            }
++            SeenAckTS = header->Timestamp;
++            SeenAckValid = true;
++        }
++        break;
++    }
+ 
+     u32 len = header->Length;
+     landiag::LastSender = (int)header->SenderID;
+@@ -1638,6 +1809,13 @@ int LAN::SendCmd(int inst, u8* packet, int len, u64 timestamp)
+ {
+     landiag::NSendCmd++;
+     if (landiag::EnvTimeoutMS()) landiag::CmdSentAt = Platform::GetUSCount();
++    if (mprec::GraceMS() && packet && len > 0)
++    {
++        ResendAck(timestamp);
++        LastCmd.assign(packet, packet + len);
++        LastCmdTS = timestamp;
++        LastCmdValid = true;
++    }
+     return SendPacketGeneric(1, packet, len, timestamp);
+ }
+ 
+@@ -1649,12 +1827,25 @@ int LAN::SendReply(int inst, u8* packet, int len, u64 timestamp, u16 aid)
+         landiag::SReply.Add(Platform::GetUSCount() - landiag::CmdRecvAt);
+         landiag::CmdRecvAt = 0;
+     }
++    if (mprec::GraceMS() && packet && len > 0 && SeenCmdValid)
++    {
++        LastReply.assign(packet, packet + len);
++        LastReplyType = 2 | (aid<<16);
++        LastReplyTS = timestamp;
++        LastReplyForCmd = SeenCmdTS;
++    }
+     return SendPacketGeneric(2 | (aid<<16), packet, len, timestamp);
+ }
+ 
+ int LAN::SendAck(int inst, u8* packet, int len, u64 timestamp)
+ {
+     landiag::NSendAck++;
++    if (mprec::GraceMS() && packet && len > 0)
++    {
++        LastAck.assign(packet, packet + len);
++        LastAckTS = timestamp;
++        LastAckValid = true;
++    }
+     return SendPacketGeneric(3, packet, len, timestamp);
+ }
+ 
+@@ -1699,6 +1890,40 @@ bool LAN::MultibootPipeline()
+     return on;
+ }
+ 
++bool LAN::TakeDuplicateCmd(ENetPacket* packet)
++{
++    if (!mprec::GraceMS()) return false;
++    MPPacketHeader* header = (MPPacketHeader*)&packet->data[0];
++    if ((header->Type & 0xFFFF) != 1) return false;
++    if (!SeenCmdValid || header->Timestamp != SeenCmdTS) return false;  // new, or not handed to the DS yet
++    // the host sent this CMD again: our reply didn't reach it (or hasn't been sent yet: then it goes out as usual)
++    mprec::NDupCmd++;
++    if (!LastReply.empty() && LastReplyForCmd == header->Timestamp)
++    {
++        if (packet->userData) LastHostPeer = (ENetPeer*)packet->userData;
++        SendPacketGeneric(LastReplyType, LastReply.data(), (int)LastReply.size(), LastReplyTS);
++        mprec::NResendReply++;
++    }
++    enet_packet_destroy(packet);
++    return true;
++}
++
++void LAN::ResendAck(u64 cmdts)
++{
++    // only the ACK of the exchange just before this CMD (emulated time restarts with each game)
++    if (!LastAckValid || LastAck.empty() || LastAckTS >= cmdts || cmdts - LastAckTS > 100000) return;
++    SendPacketGeneric(3, LastAck.data(), (int)LastAck.size(), LastAckTS);
++    mprec::NResendAck++;
++}
++
++void LAN::ResendCmd()
++{
++    if (!LastCmdValid || LastCmd.empty()) return;
++    ResendAck(LastCmdTS);
++    SendPacketGeneric(1, LastCmd.data(), (int)LastCmd.size(), LastCmdTS);
++    mprec::NResendCmd++;
++}
++
+ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+ {
+     if (!Host) return 0;
+@@ -1726,6 +1951,15 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+     auto finish = [&](bool timedout) -> u16
+     {
+         MPRecvTimeout = savedtimeout;
++        LastCmdValid = false;
++        {
++            const u64 waited = Platform::GetUSCount() - waitstart;
++            if (!timedout && waited > (u64)savedtimeout * 1000)
++            {
++                mprec::NSaved++;
++                mprec::SavedMaxUS = std::max(mprec::SavedMaxUS, waited);
++            }
++        }
+         landiag::NoteWait(waitstart);
+         if (timedout && landiag::EnvTimeoutMS()) landiag::NReplyTimeout++;
+         if (timedout && landiag::EnvTimeoutMS() && ntolog < 400)
+@@ -1771,16 +2005,47 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+     if ((myinstmask & waitmask()) == waitmask())
+     {
+         MPRecvTimeout = savedtimeout;
++        LastCmdValid = false;
+         return 0;
+     }
+ 
++    // Pixelado (mprec): a longer wait, with the CMD sent again, for players that replied lately
++    const int grace = mprec::GraceMS();
++    bool patient = !pipe && grace > savedtimeout;
++    for (int i = 0; patient && i < 16; i++)
++        if (i != MyPlayer.ID && (waitmask() & (1 << i)) && MPMissCount[i] >= mprec::kGraceMisses) patient = false;
++    u64 nextresend = waitstart + (u64)mprec::ResendMS() * 1000;
++
+     for (;;)
+     {
++        if (patient)
++        {
++            const u64 now = Platform::GetUSCount();
++            const u64 end = waitstart + (u64)grace * 1000;
++            const u64 until = std::min(end, nextresend);
++            MPRecvTimeout = until > now ? (int)((until - now + 999) / 1000) : 1;
++        }
+         ProcessLAN(2);
+         if (RXQueue.empty())
+         {
+-            // no more replies available
+-            return finish(true);
++            if (!patient)
++                // no more replies available
++                return finish(true);
++            const u64 now = Platform::GetUSCount();
++            const u16 wm = waitmask();
++            if ((myinstmask & wm) == wm)
++                return finish(false);  // the missing player left the session meanwhile
++            if (now - waitstart >= (u64)grace * 1000)
++            {
++                mprec::NGraceOut++;
++                return finish(true);
++            }
++            if (now >= nextresend)
++            {
++                ResendCmd();
++                nextresend = now + (u64)mprec::ResendMS() * 1000;
++            }
++            continue;
+         }
+ 
+         ENetPacket* enetpacket = RXQueue.front();
+diff --git a/src/net/LAN.h b/src/net/LAN.h
+index 631766f..41a47a9 100644
+--- a/src/net/LAN.h
++++ b/src/net/LAN.h
+@@ -197,6 +197,36 @@ private:
+     void RepeatAnswered(ENetPacket* packet);
+     void RepeatTick();
+ 
++    // Pixelado: MP over a radio that sometimes goes quiet for tens of ms. A CMD the host waits on is kept and sent
++    // again while its replies are missing (RecvReplies, with a longer wait, the grace); a client takes a CMD it
++    // already took once only to send its reply to it again (ProcessLAN). The DS on each side never sees the loss
++    std::vector<u8> LastCmd;          // host: the CMD being waited on
++    u64 LastCmdTS = 0;
++    bool LastCmdValid = false;
++    void ResendCmd();
++    u64 SeenCmdTS = 0;                // client: the last CMD taken in (its timestamp is the CMD's identity)
++    bool SeenCmdValid = false;
++    std::vector<u8> LastReply;        // client: our reply to it
++    u32 LastReplyType = 0;
++    u64 LastReplyTS = 0;
++    u64 LastReplyForCmd = 0;
++    bool TakeDuplicateCmd(ENetPacket* packet);
++    // the host's ACK (its end of an exchange) is sent once more before the next CMD (and with each CMD sent
++    // again): a lost ACK leaves the client's game sure its reply didn't arrive while the host's is sure it did
++    std::vector<u8> LastAck;          // host
++    u64 LastAckTS = 0;
++    bool LastAckValid = false;
++    void ResendAck(u64 cmdts);
++    u64 SeenAckTS = 0;                // client: the last ACK taken in
++    bool SeenAckValid = false;
++    // test only (BANANADS_LAN_DELAY_MS): MP frames held back before they go out, like a weak radio
++    struct Delayed { u64 At; u32 Type; std::vector<u8> Data; u64 TS; };
++    std::queue<Delayed> DelayQueue;
++    u64 DelayLastAt = 0;
++    void SendNow(u32 type, const u8* packet, int len, u64 timestamp);
++    void FlushDelayed();
++    int ServiceDelayed(ENetEvent* event, int timeout);
++
+     u32 FrameCount;
+ 
+     void ProcessDiscovery();

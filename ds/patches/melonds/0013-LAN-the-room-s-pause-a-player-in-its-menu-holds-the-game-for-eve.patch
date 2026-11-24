@@ -1,0 +1,220 @@
+From: Pixelado Dev <350114043+pixeladodev@users.noreply.github.com>
+Subject: [PATCH] LAN: the room's pause, a player in its menu holds the game for everyone
+
+Two control commands on the session's channel 0. A client whose menu opens or closes tells the host
+(Cmd_Hold, [on]); the host keeps who holds the room (HoldMask, a bit per player ID, its own
+included) and sends it to every player (Cmd_HoldState, [mask]) when it changes, to a player that
+joins while it is held, and without a player that leaves. A client that loses the host forgets it.
+LAN::SetHold, GetHoldMask, GetMyID for the frontend; a melonDS without this ignores both commands.
+
+The frontend pauses at a frame's end while another player holds the room, so emulated time stops on
+every console within a frame or two. When it runs again, LAN::HoldResumed forgets the MP misses
+counted meanwhile and Wifi::NetResumed the host's silence (HostQuietSince is wall-clock time: a
+pause longer than kHostGoneMS made the client leave MP at its first wait afterwards).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/Wifi.h b/src/Wifi.h
+index 6987d6c..d0cce10 100644
+--- a/src/Wifi.h
++++ b/src/Wifi.h
+@@ -174,6 +174,9 @@ public:
+     const u8* GetBSSID() const;
+     // BananaDS: the game's Wi-Fi is in a local multiplayer mode (host beaconing or client synced)
+     bool InMPMode() const { return IsMP; }
++    // Pixelado: the emulation ran again after a pause (the room's): the host's silence counted before it isn't the
++    // host gone (HostQuietSince is wall-clock time, and the pause would count as silence)
++    void NetResumed() { HostQuietCount = 0; }
+     // BananaDS: the game's Wi-Fi is powered on (Platform::MP_Begin was called and MP_End not since)
+     bool IsPoweredOn() const { return PowerOn; }
+ 
+diff --git a/src/net/LAN.cpp b/src/net/LAN.cpp
+index 0a8a460..9990c5f 100644
+--- a/src/net/LAN.cpp
++++ b/src/net/LAN.cpp
+@@ -311,6 +311,9 @@ enum
+     Cmd_PlayerList,         // 03 -- host->client -- broadcast updated player list
+     Cmd_PlayerConnect,      // 04 -- both -- signal connected state (ready to receive MP frames)
+     Cmd_PlayerDisconnect,   // 05 -- both -- signal disconnected state (not receiving MP frames)
++    // Pixelado: the room's pause (LAN::SetHold)
++    Cmd_Hold = 0x50,        // 50 -- client->host -- [on]: our menu opened (1) or closed (0)
++    Cmd_HoldState = 0x51,   // 51 -- host->client -- [mask lo, mask hi]: the players holding the room
+ };
+ 
+ const int kDiscoveryPort = 7063;
+@@ -675,6 +678,7 @@ bool LAN::StartHost(const char* playername, int numplayers)
+     MPActiveBitmask = 0;
+     memset(MPMissCount, 0, sizeof(MPMissCount));
+     MyMACKnown = false;
++    HoldMask = MyHold ? 1 : 0;   // (our menu open as the session starts: we hold it from the start)
+     Active = true;
+     IsHost = true;
+ 
+@@ -793,6 +797,8 @@ bool LAN::StartClient(const char* playername, const char* host)
+     MPActiveBitmask = 0;
+     memset(MPMissCount, 0, sizeof(MPMissCount));
+     MyMACKnown = false;
++    HoldMask = 0;
++    MyHold = false;   // (told to the host by the next SetHold that changes it)
+     Active = true;
+     IsHost = false;
+     return true;
+@@ -875,6 +881,7 @@ void LAN::EndSession()
+     memset(MPMissCount, 0, sizeof(MPMissCount));
+     LastHostID = -1;
+     LastHostPeer = nullptr;
++    HoldMask = 0;
+ }
+ 
+ 
+@@ -1097,6 +1104,12 @@ void LAN::ProcessHostEvent(ENetEvent& event)
+ 
+             // broadcast updated player list
+             HostUpdatePlayerList();
++            if (HoldMask & (1 << id))   // a player that leaves with its menu open: the room goes on without it
++            {
++                HoldMask &= ~(1 << id);
++                Platform::Log(Platform::LogLevel::Info, "LAN: player %d left while holding the room; held by %04X now\n", id, HoldMask);
++                HostSendHold(nullptr);
++            }
+         }
+         break;
+ 
+@@ -1141,6 +1154,22 @@ void LAN::ProcessHostEvent(ENetEvent& event)
+                     // broadcast updated player list
+                     HostUpdatePlayerList();
+                     SendWifiStateTo(event.peer, hostside->ID, "a new client");
++                    if (HoldMask) HostSendHold(event.peer);   // the room is held: it waits too
++                }
++                break;
++
++            case Cmd_Hold: // a client's menu opened or closed
++                {
++                    if (event.packet->dataLength != 2) break;
++                    Player* player = (Player*)event.peer->data;
++                    if (!player || player->ID <= 0 || player->ID >= 16) break;
++                    const u16 bit = (u16)(1 << player->ID);
++                    const u16 m = data[1] ? (u16)(HoldMask | bit) : (u16)(HoldMask & ~bit);
++                    if (m == HoldMask) break;
++                    HoldMask = m;
++                    Platform::Log(Platform::LogLevel::Info, "LAN: player %d %s the room; held by %04X\n", player->ID,
++                        data[1] ? "holds" : "lets go of", HoldMask);
++                    HostSendHold(nullptr);
+                 }
+                 break;
+ 
+@@ -1166,6 +1195,7 @@ void LAN::ProcessHostEvent(ENetEvent& event)
+                     MPSetActive(player->ID, false, "its wifi powered off");
+                 }
+                 break;
++
+             }
+ 
+             enet_packet_destroy(event.packet);
+@@ -1176,6 +1206,46 @@ void LAN::ProcessHostEvent(ENetEvent& event)
+     }
+ }
+ 
++void LAN::HostSendHold(ENetPeer* only)
++{
++    if (!Host) return;
++    u8 cmd[3] = { (u8)Cmd_HoldState, (u8)HoldMask, (u8)(HoldMask >> 8) };
++    ENetPacket* pkt = enet_packet_create(cmd, 3, ENET_PACKET_FLAG_RELIABLE);
++    if (only) enet_peer_send(only, Chan_Cmd, pkt);
++    else enet_host_broadcast(Host, Chan_Cmd, pkt);
++    enet_host_flush(Host);   // now: the frontend pauses right after
++}
++
++void LAN::SetHold(bool on)
++{
++    if (on == MyHold) return;
++    MyHold = on;
++    if (!Active || !Host) return;
++    if (IsHost)
++    {
++        const u16 bit = (u16)(1 << MyPlayer.ID);
++        const u16 m = on ? (u16)(HoldMask | bit) : (u16)(HoldMask & ~bit);
++        if (m == HoldMask) return;
++        HoldMask = m;
++        Platform::Log(Platform::LogLevel::Info, "LAN: we %s the room; held by %04X\n", on ? "hold" : "let go of", HoldMask);
++        HostSendHold(nullptr);
++    }
++    else if (RemotePeers[0])
++    {
++        u8 cmd[2] = { (u8)Cmd_Hold, (u8)(on ? 1 : 0) };
++        enet_peer_send(RemotePeers[0], Chan_Cmd, enet_packet_create(cmd, 2, ENET_PACKET_FLAG_RELIABLE));
++        enet_host_flush(Host);
++        Platform::Log(Platform::LogLevel::Info, "LAN: we %s the room (told the host)\n", on ? "hold" : "let go of");
++    }
++}
++
++void LAN::HoldResumed()
++{
++    // the pause stopped every console within a frame or two of each other: the replies missed meanwhile weren't a
++    // player gone
++    memset(MPMissCount, 0, sizeof(MPMissCount));
++}
++
+ void LAN::ProcessClientEvent(ENetEvent& event)
+ {
+     switch (event.type)
+@@ -1221,6 +1291,11 @@ void LAN::ProcessClientEvent(ENetEvent& event)
+ 
+             int id = player->ID;
+             RemotePeers[id] = nullptr;
++            if (id == 0 && HoldMask)   // the host gone: nobody holds the room
++            {
++                HoldMask = 0;
++                Platform::Log(Platform::LogLevel::Info, "LAN: the host left; the room isn't held\n");
++            }
+ 
+             Platform::Mutex_Lock(PlayersMutex);
+             player->Status = Player_Disconnected;
+@@ -1298,6 +1373,15 @@ void LAN::ProcessClientEvent(ENetEvent& event)
+                     MPSetActive(player->ID, false, "its wifi powered off");
+                 }
+                 break;
++            case Cmd_HoldState: // the host: who holds the room
++                {
++                    if (event.packet->dataLength != 3 || event.peer != RemotePeers[0]) break;
++                    const u16 m = (u16)(data[1] | (data[2] << 8));
++                    if (m != HoldMask)
++                        Platform::Log(Platform::LogLevel::Info, "LAN: the room held by %04X (was %04X)\n", m, HoldMask);
++                    HoldMask = m;
++                }
++                break;
+             }
+ 
+             enet_packet_destroy(event.packet);
+diff --git a/src/net/LAN.h b/src/net/LAN.h
+index bc8ecd1..2830f86 100644
+--- a/src/net/LAN.h
++++ b/src/net/LAN.h
+@@ -134,6 +134,16 @@ public:
+     u32 GetDiscoveryNonce() const { return DiscoveryNonce; }
+     static bool ReadDiscoveryTag(const DiscoveryData& data, DiscoveryTag& tag);
+ 
++    // Pixelado: the room's pause. A player whose in-game menu is open holds the game for everyone in the session: it
++    // tells the host (Cmd_Hold), the host keeps who holds it (HoldMask, a bit per player ID, its own included) and
++    // sends that to every player (Cmd_HoldState) when it changes, to a player that joins, and without a player that
++    // leaves. Each frontend then pauses at a frame's end while someone else holds the room, so nobody's MP waits
++    // run out (emulated time stops on every console). A melonDS without this ignores both commands.
++    void SetHold(bool on);                                   // our menu is open (any time; sent once in a session)
++    u16 GetHoldMask() const noexcept { return Active ? HoldMask : 0; }
++    int GetMyID() const noexcept { return MyPlayer.ID; }
++    void HoldResumed();                                      // the game runs again: MP misses from before forgotten
++
+ private:
+     bool Inited;
+     bool Active;
+@@ -230,6 +240,10 @@ private:
+ 
+     u32 FrameCount;
+ 
++    u16 HoldMask = 0;     // Pixelado: who holds the room (the host's word; a host's own)
++    bool MyHold = false;  // our menu is open
++    void HostSendHold(ENetPeer* only);   // HoldMask to one player, or (nullptr) to all
++
+     void ProcessDiscovery();
+ 
+     void HostUpdatePlayerList();

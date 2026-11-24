@@ -1,0 +1,29 @@
+name: build-ds
+
+on:
+  push:
+    branches: [main]
+    paths: ['ds/**', 'NOTICE', 'LICENSE', '.github/workflows/build-ds.yml']
+    tags: ['ds-v*']
+  pull_request:
+    paths: ['ds/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (the binary must match binary_sha in ds/manifest)
+        run: ds/build/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pixelado-core-ds-${{ github.run_number }}
+          path: |
+            ds/dist/pixelado-core-ds-*.zip
+            ds/dist/SHA256SUMS
+          if-no-files-found: error

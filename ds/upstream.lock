@@ -1,0 +1,8 @@
+# What pixelado-core-ds is built on. build/fetch-sources.sh reads it; nothing else is downloaded for the emulator.
+# BananaDS (JorreFog's SuperDrastic, bananads/ in that tree): upstream e54aaa8, the BananaDS that
+# BananaOS 0.5.3.5 and later package.
+superdrastic_repo=https://github.com/JorreFog/SuperDrastic.git
+superdrastic=e54aaa8e2693352ad9f33a0d3d75ea4b887f1957
+# melonDS, the base BananaDS's own patches (bananads/patches/melonds) apply to
+melonds_repo=https://github.com/melonDS-emu/melonDS
+melonds=906e9ebb27da8c6a715cd7abab4abfe8a8d29427

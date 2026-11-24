@@ -1,0 +1,384 @@
+From: Pixelado Dev <350114043+pixeladodev@users.noreply.github.com>
+Subject: [PATCH] LAN: the transport (the MP receive timeout, DSCP 46, TDLS, no ENet throttle)
+
+* LAN: BANANADS_LAN_TIMEOUT_MS, the MP receive timeout, and both sides' waits
+
+For testing local wireless between two handhelds on a Wi-Fi network with
+latency spikes. The LAN host blocks up to MPRecvTimeout (25 ms) for its
+players' replies to every MP command, and a child as long for the host's
+packet; each 20-100 ms spike of the access point's two hops costs both
+consoles frames (Mario Kart DS at ~50 fps).
+
+BANANADS_LAN_TIMEOUT_MS (1-100), read once from the environment, replaces
+the 25 ms on both sides; unset (or invalid, with a warning), nothing
+changes. The effective value is logged at the Info level when a LAN
+object is made. With the variable set, the per-second "[diag] LAN last"
+line is logged at the Info level on the host and on the child, with the
+number of waits, the time blocked in them (total and longest) and the
+host's reply waits that timed out.
+
+* LAN: the session's packets in the Wi-Fi voice queue (DSCP 46 by default, BANANADS_LAN_DSCP picks another or 0 turns it off)
+
+* LAN: TDLS, a direct Wi-Fi link from the host to each console that joins (opt-in: BANANADS_LAN_TDLS=1)
+
+* LAN: ENet's packet throttle off, so it never drops a MP packet
+---
+diff --git a/src/net/LAN.cpp b/src/net/LAN.cpp
+index 07efd75..bc83814 100644
+--- a/src/net/LAN.cpp
++++ b/src/net/LAN.cpp
+@@ -18,6 +18,7 @@
+ 
+ #include <stdio.h>
+ #include <string.h>
++#include <stdlib.h>
+ 
+ #ifdef __WIN32__
+     #include <winsock2.h>
+@@ -29,6 +30,7 @@
+ #else
+     #include <unistd.h>
+     #include <netinet/in.h>
++    #include <netinet/ip.h>
+     #include <sys/select.h>
+     #include <sys/socket.h>
+ 
+@@ -71,6 +73,56 @@ static u16 LastBitmask = 0xFFFF;
+ // per-second counters, reported from Process()
+ static u64 CountStart = 0;
+ static int NSendPkt, NSendCmd, NSendReply, NSendAck, NRecvPkt, NRecvHost, NHostTimeout;
++// with BANANADS_LAN_TIMEOUT_MS set: the time blocked in RecvReplies (host) and RecvHostPacket (client)
++static u64 WaitUS, WaitMaxUS;
++static int NWaits, NReplyTimeout;
++
++// BananaDS: BANANADS_LAN_TIMEOUT_MS (1-100) replaces MPRecvTimeout's 25 ms; read once, 0 when unset (or invalid)
++static int EnvTimeoutMS()
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        v = 0;
++        const char* e = getenv("BANANADS_LAN_TIMEOUT_MS");
++        if (e && *e)
++        {
++            char* end = nullptr;
++            long n = strtol(e, &end, 10);
++            if (end && *end == 0 && n >= 1 && n <= 100) v = (int)n;
++            else Platform::Log(Platform::LogLevel::Warn, "LAN: BANANADS_LAN_TIMEOUT_MS=%s ignored (1-100 ms)\n", e);
++        }
++    }
++    return v;
++}
++
++// BananaDS: ENet's packet throttle drops unreliable and unsequenced packets (every MP command, reply and ack goes
++// as one) while it is under its limit, and it steps down whenever a reliable round trip comes back slower than the
++// last one plus twice its variance, which a Wi-Fi link does every few seconds. Each dropped MP packet costs a full
++// MP receive timeout on the side that waits for it. MP packets are never resent, so nothing gains from the throttle:
++// it's kept at its top (deceleration 0) on every peer, unless BANANADS_LAN_ENET_THROTTLE=1 (ENet's default).
++static void PeerNoThrottle(ENetPeer* peer)
++{
++    static int keep = -1;
++    if (keep < 0)
++    {
++        const char* e = getenv("BANANADS_LAN_ENET_THROTTLE");
++        keep = (e && e[0] == '1') ? 1 : 0;
++        Platform::Log(Platform::LogLevel::Info, "LAN: ENet packet throttle %s\n",
++            keep ? "as ENet has it (BANANADS_LAN_ENET_THROTTLE=1)" : "off: MP packets are never dropped by it");
++    }
++    if (keep || !peer) return;
++    enet_peer_throttle_configure(peer, ENET_PEER_PACKET_THROTTLE_INTERVAL, ENET_PEER_PACKET_THROTTLE_ACCELERATION, 0);
++    peer->packetThrottle = ENET_PEER_PACKET_THROTTLE_SCALE;
++}
++
++static void NoteWait(u64 start)
++{
++    if (!EnvTimeoutMS()) return;
++    u64 us = Platform::GetUSCount() - start;
++    WaitUS += us; NWaits++;
++    if (us > WaitMaxUS) WaitMaxUS = us;
++}
+ 
+ static bool Allow(Rate& r, int max, const char* cat)
+ {
+@@ -172,6 +224,9 @@ LAN::LAN() noexcept : Inited(false)
+     MyMACKnown = false;
+ 
+     MPRecvTimeout = 25;
++    if (landiag::EnvTimeoutMS()) MPRecvTimeout = landiag::EnvTimeoutMS();
++    Platform::Log(Platform::LogLevel::Info, "LAN: MP receive timeout %d ms (%s)\n", MPRecvTimeout,
++        landiag::EnvTimeoutMS() ? "BANANADS_LAN_TIMEOUT_MS" : "default");
+     LastHostID = -1;
+     LastHostPeer = nullptr;
+ 
+@@ -311,6 +366,147 @@ void LAN::EndDiscovery()
+         Active = false;
+ }
+ 
++#ifndef _WIN32
++#include <sys/un.h>
++#include <sys/time.h>
++#include <arpa/inet.h>
++
++// BananaDS: off by default; with BANANADS_LAN_TDLS=1 the host asks wpa_supplicant for a TDLS link with each console that joins when they
++// are on the same Wi-Fi network: their packets then go straight from one console to the other instead of through the
++// access point, which in our measurements cut the round trip by about 1.5 ms and brought home Wi-Fi to Direct Link's
++// frame rate, but on the RTL8821CS it also brought bursts of late packets that ended Mario Kart DS sessions (5 of
++// 8 games), so it stays opt-in. Only in station mode (Direct Link is IBSS and goes direct already); any failure leaves things as they are.
++static char BananaTdlsPeers[16][18] = {};
++
++// One command to wpa_supplicant's control socket; returns the reply length, or -1.
++static int BananaWpaCmd(const char* cmd, char* reply, size_t replylen)
++{
++    const char* ifname = getenv("BANANADS_LAN_TDLS_IF");
++    if (!ifname || !*ifname) ifname = "wlan0";
++    const char* dirs[] = {"/run/wpa_supplicant", "/var/run/wpa_supplicant"};
++    for (const char* dir : dirs)
++    {
++        struct sockaddr_un dst = {};
++        dst.sun_family = AF_UNIX;
++        snprintf(dst.sun_path, sizeof(dst.sun_path), "%s/%s", dir, ifname);
++        if (access(dst.sun_path, F_OK) != 0) continue;
++
++        int s = socket(AF_UNIX, SOCK_DGRAM, 0);
++        if (s < 0) return -1;
++        struct sockaddr_un local = {};
++        local.sun_family = AF_UNIX;
++        snprintf(local.sun_path, sizeof(local.sun_path), "/tmp/bananads-wpa-%d", (int)getpid());
++        unlink(local.sun_path);
++        int n = -1;
++        if (bind(s, (sockaddr_t*)&local, sizeof(local)) == 0)
++        {
++            struct timeval tv = {1, 0};
++            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++            if (connect(s, (sockaddr_t*)&dst, sizeof(dst)) == 0 && send(s, cmd, strlen(cmd), 0) >= 0)
++            {
++                n = (int)recv(s, reply, replylen - 1, 0);
++                if (n >= 0) reply[n] = '\0';
++            }
++            unlink(local.sun_path);
++        }
++        close(s);
++        return n;
++    }
++    return -1;
++}
++
++static void BananaTdlsSetup(u32 peeraddr)
++{
++    const char* e = getenv("BANANADS_LAN_TDLS");
++    if (!e || strcmp(e, "1") != 0) return;
++    struct in_addr ia;
++    ia.s_addr = peeraddr;
++    char ip[INET_ADDRSTRLEN];
++    if (!inet_ntop(AF_INET, &ia, ip, sizeof(ip))) return;
++
++    char buf[4096];
++    if (BananaWpaCmd("STATUS", buf, sizeof(buf)) <= 0 || !strstr(buf, "mode=station"))
++    {
++        Platform::Log(Platform::LogLevel::Info, "LAN: TDLS skipped, Wi-Fi is not in station mode\n");
++        return;
++    }
++
++    // The host's MAC, from the kernel's neighbour table (the connection just exchanged packets with it).
++    char mac[18] = "";
++    FILE* f = fopen("/proc/net/arp", "r");
++    if (f)
++    {
++        char line[256];
++        while (fgets(line, sizeof(line), f))
++        {
++            char aip[64], hw[64], flags[32];
++            if (sscanf(line, "%63s %*s %31s %63s", aip, flags, hw) == 3 && !strcmp(aip, ip)
++                && strtol(flags, nullptr, 16) & 0x2)
++            {
++                snprintf(mac, sizeof(mac), "%s", hw);
++                break;
++            }
++        }
++        fclose(f);
++    }
++    if (!mac[0])
++    {
++        Platform::Log(Platform::LogLevel::Info, "LAN: TDLS skipped, no MAC for %s\n", ip);
++        return;
++    }
++
++    char cmd[64];
++    snprintf(cmd, sizeof(cmd), "TDLS_SETUP %s", mac);
++    int n = BananaWpaCmd(cmd, buf, sizeof(buf));
++    bool ok = n > 0 && !strncmp(buf, "OK", 2);
++    if (ok)
++    {
++        for (auto& slot : BananaTdlsPeers)
++        {
++            if (!strcmp(slot, mac)) break;
++            if (!slot[0]) { snprintf(slot, sizeof(slot), "%s", mac); break; }
++        }
++    }
++    Platform::Log(Platform::LogLevel::Info, "LAN: TDLS with %s (%s): %s\n", ip, mac, ok ? "requested" : "refused");
++}
++
++static void BananaTdlsTeardown()
++{
++    for (auto& slot : BananaTdlsPeers)
++    {
++        if (!slot[0]) continue;
++        char cmd[64], buf[256];
++        snprintf(cmd, sizeof(cmd), "TDLS_TEARDOWN %s", slot);
++        int n = BananaWpaCmd(cmd, buf, sizeof(buf));
++        Platform::Log(Platform::LogLevel::Info, "LAN: TDLS with %s ended: %s\n", slot,
++            n > 0 && !strncmp(buf, "OK", 2) ? "ok" : "failed");
++        slot[0] = '\0';
++    }
++}
++#else
++static void BananaTdlsSetup(u32) {}
++static void BananaTdlsTeardown() {}
++#endif
++
++// BananaDS: the session's UDP packets are marked with DSCP 46 (EF) by default; BANANADS_LAN_DSCP (0-63, in
++// /data/banana/bananads.env) picks another, 0 turns it off. With 46: Linux's Wi-Fi stack and most access points then send them in the voice
++// queue (WMM AC_VO), ahead of the household's other traffic. Discovery broadcasts are left as they are.
++static void BananaSetDSCP(ENetHost* host)
++{
++#ifndef _WIN32
++    const char* e = getenv("BANANADS_LAN_DSCP");
++    if (!host) return;
++    int dscp = (e && *e) ? atoi(e) : 46;
++    if (dscp <= 0 || dscp > 63) return;
++    int tos = dscp << 2;
++    int r = setsockopt(host->socket, IPPROTO_IP, IP_TOS, (const char*)&tos, sizeof(tos));
++    Platform::Log(Platform::LogLevel::Info, "LAN: DSCP %d (TOS 0x%02x) on the session's socket: %s\n", dscp, tos,
++        r == 0 ? "ok" : "failed");
++#else
++    (void)host;
++#endif
++}
++
+ bool LAN::StartHost(const char* playername, int numplayers)
+ {
+     if (!Inited) return false;
+@@ -325,6 +521,7 @@ bool LAN::StartHost(const char* playername, int numplayers)
+     {
+         return false;
+     }
++    BananaSetDSCP(Host);
+ 
+     Platform::Mutex_Lock(PlayersMutex);
+ 
+@@ -363,6 +560,7 @@ bool LAN::StartClient(const char* playername, const char* host)
+     {
+         return false;
+     }
++    BananaSetDSCP(Host);
+ 
+     ENetAddress addr;
+     enet_address_set_host(&addr, host);
+@@ -400,6 +598,7 @@ bool LAN::StartClient(const char* playername, const char* host)
+             if (conn == 0 && event.type == ENET_EVENT_TYPE_CONNECT)
+             {
+                 conn = 1;
++                landiag::PeerNoThrottle(event.peer);
+             }
+             else if (conn == 1 && event.type == ENET_EVENT_TYPE_RECEIVE)
+             {
+@@ -531,6 +730,7 @@ void LAN::EndSession()
+     enet_host_destroy(Host);
+     Host = nullptr;
+     IsHost = false;
++    BananaTdlsTeardown();
+ 
+     // BananaDS: nothing of this session carries over into the next one (the frontend can end a session and start
+     // another in the same run): its players, who was connected, who was in a DS group with us
+@@ -693,6 +893,7 @@ void LAN::ProcessHostEvent(ENetEvent& event)
+     {
+     case ENET_EVENT_TYPE_CONNECT:
+         {
++            landiag::PeerNoThrottle(event.peer);
+             if ((NumPlayers >= MaxPlayers) || (NumPlayers >= 16))
+             {
+                 // game is full, reject connection
+@@ -700,6 +901,8 @@ void LAN::ProcessHostEvent(ENetEvent& event)
+                 break;
+             }
+ 
++            BananaTdlsSetup(event.peer->address.host);
++
+             // client connected; assign player number
+ 
+             int id;
+@@ -848,6 +1051,7 @@ void LAN::ProcessClientEvent(ENetEvent& event)
+     {
+     case ENET_EVENT_TYPE_CONNECT:
+         {
++            landiag::PeerNoThrottle(event.peer);
+             // another client is establishing a direct connection to us
+ 
+             int playerid = -1;
+@@ -1097,10 +1301,39 @@ void LAN::Process()
+         {
+             if (landiag::NSendPkt || landiag::NSendCmd || landiag::NSendReply || landiag::NSendAck ||
+                 landiag::NRecvPkt || landiag::NRecvHost || landiag::NHostTimeout)
++            {
++                if (landiag::EnvTimeoutMS())
++                    // both sides, at the Info level: the host's waits for replies, the client's for the host
++                    Platform::Log(Platform::LogLevel::Info,
++                        "[diag] LAN last %llu ms: sent pkt=%d cmd=%d reply=%d ack=%d; got pkt=%d host=%d; host-wait timeouts=%d; connected=%04X; waits=%d total=%llu ms max=%llu.%llu ms; reply timeouts=%d (timeout %d ms)\n",
++                        (unsigned long long)(now - landiag::CountStart), landiag::NSendPkt, landiag::NSendCmd, landiag::NSendReply,
++                        landiag::NSendAck, landiag::NRecvPkt, landiag::NRecvHost, landiag::NHostTimeout, ConnectedBitmask,
++                        landiag::NWaits, (unsigned long long)(landiag::WaitUS / 1000), (unsigned long long)(landiag::WaitMaxUS / 1000),
++                        (unsigned long long)(landiag::WaitMaxUS / 100 % 10), landiag::NReplyTimeout, MPRecvTimeout);
++                else
+                 Platform::Log(Platform::LogLevel::Debug,
+                     "[diag] LAN last %llu ms: sent pkt=%d cmd=%d reply=%d ack=%d; got pkt=%d host=%d; host-wait timeouts=%d; connected=%04X\n",
+                     (unsigned long long)(now - landiag::CountStart), landiag::NSendPkt, landiag::NSendCmd, landiag::NSendReply,
+                     landiag::NSendAck, landiag::NRecvPkt, landiag::NRecvHost, landiag::NHostTimeout, ConnectedBitmask);
++            }
++            if (landiag::EnvTimeoutMS() && Host)
++            {
++                // ENet's view of each peer: its smoothed round trip (reliable packets) and the packet throttle (32: none dropped)
++                char pb[256];
++                int pn = 0;
++                pb[0] = 0;
++                for (size_t i = 0; i < Host->peerCount && pn < (int)sizeof pb - 48; i++)
++                {
++                    ENetPeer* pe = &Host->peers[i];
++                    if (pe->state != ENET_PEER_STATE_CONNECTED) continue;
++                    pn += snprintf(pb + pn, sizeof pb - pn, " %u.%u.%u.%u rtt=%u+-%u throttle=%u/32;",
++                        pe->address.host & 0xff, (pe->address.host >> 8) & 0xff, (pe->address.host >> 16) & 0xff,
++                        pe->address.host >> 24, pe->roundTripTime, pe->roundTripTimeVariance, pe->packetThrottle);
++                }
++                if (pn) Platform::Log(Platform::LogLevel::Info, "[diag] LAN enet:%s\n", pb);
++            }
++            landiag::WaitUS = landiag::WaitMaxUS = 0;
++            landiag::NWaits = landiag::NReplyTimeout = 0;
+             landiag::NSendPkt = landiag::NSendCmd = landiag::NSendReply = landiag::NSendAck = 0;
+             landiag::NRecvPkt = landiag::NRecvHost = landiag::NHostTimeout = 0;
+             landiag::CountStart = now;
+@@ -1357,7 +1590,9 @@ int LAN::RecvHostPacket(int inst, u8* packet, u64* timestamp)
+         }
+     }
+ 
++    const u64 waitstart = Platform::GetUSCount();
+     int ret = RecvPacketGeneric(packet, true, timestamp);
++    landiag::NoteWait(waitstart);
+     if (ret > 0) landiag::NRecvHost++;
+     else landiag::NHostTimeout++;
+     return ret;
+@@ -1371,6 +1606,7 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+     u16 myinstmask = 1 << MyPlayer.ID;
+     u16 alivemask = 0;                 // players a reply came from (even a late one)
+     std::vector<ENetPacket*> deferred; // non-MP frames met while waiting
++    const u64 waitstart = Platform::GetUSCount();
+ 
+     // only the LAN players that take part in local MP with us are waited for (MPActiveBitmask, see LAN.h)
+     auto waitmask = [&]() -> u16
+@@ -1379,6 +1615,8 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
+     };
+     auto finish = [&](bool timedout) -> u16
+     {
++        landiag::NoteWait(waitstart);
++        if (timedout && landiag::EnvTimeoutMS()) landiag::NReplyTimeout++;
+         // non-MP frames (deauth, auth, association requests...) that arrived during the wait go back to the
+         // front of the queue for the regular RX path (CheckRX), in their order, instead of being thrown away
+         // (stamped as received now: the console couldn't look at them while it was blocked here)

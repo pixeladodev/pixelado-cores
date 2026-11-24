@@ -1,0 +1,822 @@
+From: Pixelado Dev <350114043+pixeladodev@users.noreply.github.com>
+Subject: [PATCH] Party menu: the screen handed to Pixelado Party for the in-game menu
+
+With party.fd (Pixelado Party runs the engine as its child), the menu and the room's wait screen are Party's: the engine pauses, writes both panels into a memfd (PXF1), drops DRM master and says SCREEN released; Party draws and gives the screen back. Volume, brightness, the FPS counter, the local wireless page and the quit come back as CMD lines. No channel, or no answer in time: the engine's own menu (BananaDS's menu.c, with 0004), as before. The channel is always built in.
+
+A menu key's release opens the menu only after its press was seen while the game had the screen (F's release, after its press closed Party's menu, opened it again: a loop), and the menu keys do nothing for 250 ms after a menu closed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+
+diff --git a/bananads/CMakeLists.txt b/bananads/CMakeLists.txt
+index a204ef2..07d8412 100644
+--- a/bananads/CMakeLists.txt
++++ b/bananads/CMakeLists.txt
+@@ -240,6 +240,7 @@ add_executable(bananads
+     src/wifi.cpp
+     src/lobbyctl.cpp
+     src/roomctl.cpp
++    src/partyctl.cpp
+     src/video_headless.cpp)
+ target_include_directories(bananads PRIVATE src)
+ target_link_libraries(bananads PRIVATE core bananads-net pthread ${CMAKE_DL_LIBS})
+diff --git a/bananads/src/frontend_kms.cpp b/bananads/src/frontend_kms.cpp
+index 1b744aa..c253cfd 100644
+--- a/bananads/src/frontend_kms.cpp
++++ b/bananads/src/frontend_kms.cpp
+@@ -76,6 +76,7 @@
+ #include "cheats.h"
+ #include "screenshot.h"
+ #include "menu.h"
++#include "partyctl.h"
+ #include "prof.h"
+ #include "ra.h"
+ #include "companion.h"
+@@ -660,16 +661,33 @@ struct Display {
+         return ret == 0;
+     }
+     void show_menu(int panel, int k) { commit_now(panel, 0, &mbuf[panel][k], nullptr); }
++    // Pixelado Party had the screen (DRM master, its own buffers on the CRTCs): both panels lit in their modes again
++    // with the game's last frame
++    void show_game_modeset() {
++        Lock l(mu);
++        if (scanout < 0) return;
++        const int t = swapped ? 1 : 0;
++        const Buf* o[2] = {scanout_out[0] ? scanout_out[0] : slot(t, scanout), scanout_out[1] ? scanout_out[1] : slot(t ^ 1, scanout)};
++        drmModeAtomicReq* r = drmModeAtomicAlloc();
++        add_modeset(r);
++        for (int i = 0; i < 2; i++) add_plane(r, p[i], *o[i]);
++        int ret = drmModeAtomicCommit(fd, r, DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr);
++        drmModeAtomicFree(r);
++        if (ret) Log(LogLevel::Warn, "[kms] the game's frame back after Party: %s\n", strerror(errno));
++    }
+     void show_game() {
+         Lock l(mu);
+         const int t = swapped ? 1 : 0;   // (what each panel showed; the game's buffers, as swapped, before a first commit)
+         if (scanout >= 0) commit_now(0, 1, scanout_out[0] ? scanout_out[0] : slot(t, scanout), scanout_out[1] ? scanout_out[1] : slot(t ^ 1, scanout));
+     }
+     // the game's top screen as last shown (through the shader, when one is on: #49), at the panel's size (nearest)
+-    bool grab_top(uint32_t* dst, int pitch, int w, int h) {
++    bool grab_top(uint32_t* dst, int pitch, int w, int h) { return grab(0, dst, pitch, w, h); }
++    // a panel's picture as last shown (0 top, 1 bottom; as swapped), at w x h (nearest): Pixelado Party's frame
++    bool grab(int panel, uint32_t* dst, int pitch, int w, int h) {
+         Lock l(mu);
+         if (scanout < 0) return false;
+-        const Buf& b = scanout_out[0] ? *scanout_out[0] : *slot(0, scanout);
++        const int t = (swapped ? 1 : 0) ^ panel;
++        const Buf& b = scanout_out[panel] ? *scanout_out[panel] : *slot(t, scanout);
+         if (!b.map || !b.w || !b.h) return false;
+         const int sw = (int)b.w, sh = (int)b.h;
+         std::vector<uint32_t> row(sw);
+@@ -2102,6 +2120,70 @@ static void mh_lan_link_set(void*, int direct) {
+     save_opt("wifi.local_link", direct ? "direct" : "router");
+ }
+ 
++// ---- Pixelado Party's menu (partyctl.h): the display, the room and the menu's settings for it --------------------
++struct KmsParty : PartyHost {
++    MenuHost* mh;
++    explicit KmsParty(MenuHost* m) : mh(m) {}
++    long long held_since = 0;   // a menu button down since (us), while Party has the screen
++    int held_codes = 0;
++    bool drop_master() override { return drmDropMaster(mh->dp->fd) == 0; }
++    bool take_master(int ms) override {
++        for (int i = 0; i * 10 < ms; i++) {
++            if (drmSetMaster(mh->dp->fd) == 0) return true;
++            usleep(10000);
++        }
++        return false;
++    }
++    void panel_size(int* w, int* h) override { *w = mh->dp->W; *h = mh->dp->H; }
++    bool grab(int panel, uint32_t* dst, int w, int h) override { return mh->dp->grab(panel, dst, w * 4, w, h); }
++    void repaint() override {
++        mh->dp->show_game_modeset();
++        held_since = 0;
++        held_codes = 0;
++    }
++    void hold_set(bool on) override { mh->emu->room_hold_set(on); }
++    int hold_others(std::string& names) override {
++        const int k = mh->emu->room_hold_others();
++        names = k > 0 ? mh->emu->room_hold_names() : "";
++        return k;
++    }
++    bool lan(bmenu_lan& st) override { return mh_lan_get(mh, &st) != 0; }
++    void lan_set(int mode, int max_players, const std::string& addr) override { mh_lan_set(mh, mode, max_players, addr.c_str()); }
++    int mp_lock() override { return mh_mp_lock(mh); }
++    void opts_open(int* vol, int* bri, int* fps) override { bmenu_ext_open(vol, bri, fps); }
++    void opt_set(const std::string& key, int v) override { bmenu_ext_set(key.c_str(), v); }
++    int opts_tick(int* vol, int* bri) override { return bmenu_ext_tick(vol, bri); }
++    void opts_close() override { bmenu_ext_close(); }
++    void sound(int id) override { bmenu_ext_sound(id); }
++    void quit() override { mh->quit = true; }
++    int menu_held_ms() override {
++        // (the governor counts the game's frames as mh_poll does)
++        if (mh->feed) mh->feed->frames = mh->dp->made.load();
++        for (auto& d : *mh->devs) {
++            input_event e[64];
++            ssize_t n;
++            while ((n = read(d.fd, e, sizeof e)) > 0)
++                for (int j = 0; j < n / (int)sizeof(input_event); j++) {
++                    const input_event& x = e[j];
++                    if (x.type != EV_KEY || x.value == 2 || d.touch) continue;
++                    int bit = x.code == BTN_MODE || x.code == KEY_F1 ? 1 : x.code == BTN_Z ? 2 : x.code == KEY_F2 ? 4
++                            : x.code == BTN_THUMBL ? 8 : 0;
++                    if (!bit) continue;
++                    if (x.value) {
++                        if (!held_codes) held_since = now_us();
++                        held_codes |= bit;
++                    } else {
++                        held_codes &= ~bit;
++                        if (!held_codes) held_since = 0;
++                    }
++                }
++        }
++        return held_codes && held_since ? (int)((now_us() - held_since) / 1000) : 0;
++    }
++    bool stopping() override { return g_quit.load(); }
++    void log(const char* line) override { Log(LogLevel::Info, "%s", line); }
++};
++
+ // ---- the frontend ---------------------------------------------------------------------------------------------
+ 
+ int run_kms(Emu& emu, const Config& cfg) {
+@@ -2335,6 +2417,15 @@ int run_kms(Emu& emu, const Config& cfg) {
+         start_mark("menu options");
+         bmenu_init(&h);
+         start_mark("menu init");
++        {   // Pixelado Party runs us as its child: its end of the channel (ROOM-PROTOCOL.md §12.2)
++            std::string pfd = cfg.str("party.fd", "");
++            if (pfd.empty() && getenv("PIXELADO_PARTY_FD")) pfd = getenv("PIXELADO_PARTY_FD");
++            if (!pfd.empty()) {
++                const bool ok = party_open(atoi(pfd.c_str()), bmenu_game(), h.resume_on, cfg.str("room.gid", ""));
++                Log(LogLevel::Info, "[party] %s (fd %s)\n", ok ? "Pixelado Party's channel: the menu is Party's"
++                                                              : "no channel to Pixelado Party: our own menu", pfd.c_str());
++            }
++        }
+         // cheats.dir (<BANANADS_DATA>/cheats): the games' .mch files; then RetroArch .cht files from cheats.retroarch_dir
+         // (the card's RetroArch folder) and cheats.system_dir (the collection that comes with BananaOS)
+         // (read on cheats_load's thread since run_kms began)
+@@ -2761,6 +2852,10 @@ int run_kms(Emu& emu, const Config& cfg) {
+     bool hot = false, menu_down = false;
+     bool hot_used = false;      // a button went down while F was held (F + something, not F alone)
+     bool home_down = false, home_used = false;  // HOME held, and a key (a volume key: a modifier) pressed meanwhile
++    // the menu keys (F, HOME, the menu button, L3 as menu) do nothing until then: just after a menu closed. A menu
++    // key's release opens the menu only after its press was seen here: Pixelado Party's menu closes on the key's
++    // press, and its release, read here once the screen was back, opened the menu again (and again)
++    long long menu_quiet_until = 0;
+     uint32_t stick_keys = 0;    // the d-pad directions the left stick holds
+     uint32_t pad_down = 0;      // the pad's buttons held (P_*), each doing its input.<button> job
+     // the menu: the game paused at its next frame, the flips in flight done, then the menu until it closes; the
+@@ -2795,7 +2890,26 @@ int run_kms(Emu& emu, const Config& cfg) {
+         mh.quit = false;
+         mh.nosave = false;
+         dp.icon_plane_menu(true);
++        bool party_quit = false;   // quit in Pixelado Party's menu: Party keeps the screen until we are gone
++        KmsParty kp(&mh);
++        bool party_tried = false;
+         for (bool menu = start >= 0;;) {
++            // Pixelado Party draws the menu and the wait screen when it runs us (partyctl.h); without it, or when it
++            // doesn't answer, ours below (the main page and the wait screen only: the other pages are ours)
++            if (!party_tried && start <= 0 && party_up()) {
++                party_tried = true;
++                if (menu) emu.room_hold_set(true);
++                const PartyMenu r = party_menu(kp, menu);
++                if (r == PartyMenu::Quit) { party_quit = true; break; }
++                if (r == PartyMenu::Done) {
++                    if (mh.quit || g_quit || emu.room_hold_others() <= 0 || !run.load()) break;
++                    party_tried = false;   // (others still hold the room: Party's wait screen)
++                    menu = false;
++                    continue;
++                }
++                if (r == PartyMenu::Unavailable) Log(LogLevel::Info, "[kms] menu: our own (Party not there)\n");
++                if (menu) start = 0;
++            }
+             if (menu) {
+                 emu.room_hold_set(true);
+                 mh.q.clear();
+@@ -2824,7 +2938,7 @@ int run_kms(Emu& emu, const Config& cfg) {
+             Lock l(dp.mu);
+             dp.last_flip = 0;
+         }
+-        dp.show_game();
++        if (!party_quit) dp.show_game();
+         dp.icon_plane_menu(false);
+         keys = 0;
+         stick_keys = 0;
+@@ -2832,6 +2946,7 @@ int run_kms(Emu& emu, const Config& cfg) {
+         hot = false;
+         home_down = false;
+         menu_down = false;
++        menu_quiet_until = now_us() + 250000;
+         in_keys = 0;
+         in_touch = -1;
+         if (mh.quit) {
+@@ -2862,7 +2977,7 @@ int run_kms(Emu& emu, const Config& cfg) {
+         switch (t) {
+             case PAD_MENU:  // (opens on release: nothing of it reaches the game)
+                 if (!menu_on) break;
+-                if (down) menu_down = true;
++                if (down) menu_down = now_us() >= menu_quiet_until;
+                 else if (menu_down) { menu_down = false; open_menu(0); }
+                 break;
+             case PAD_SWAP: if (down) swap_toggle(dp, mh.rom); break;
+@@ -3011,14 +3126,14 @@ int run_kms(Emu& emu, const Config& cfg) {
+                     if (x.type != EV_KEY || x.value == 2) continue;
+                     if (home_down && x.value && x.code != BTN_Z) home_used = true;  // HOME + something: not HOME alone
+                     if (x.code == BTN_Z) {  // HOME: the menu, on release (whatever F and the pad's buttons do), when let go on its own
+-                        if (x.value) { home_down = true; home_used = false; continue; }
++                        if (x.value) { home_down = now_us() >= menu_quiet_until; home_used = false; continue; }
+                         if (home_down && !home_used && menu_on) open_menu(0);
+                         home_down = false;
+                         continue;
+                     }
+                     if (hot && x.value && !is_hotkey(x.code)) hot_used = true;  // F + something: not F alone
+                     if (menu_on && is_menu_button(x.code)) {  // (opens on release: nothing of it reaches the game)
+-                        if (x.value) menu_down = true;
++                        if (x.value) menu_down = now_us() >= menu_quiet_until;
+                         else if (menu_down) {
+                             menu_down = false;
+                             open_menu(0);
+@@ -3028,10 +3143,11 @@ int run_kms(Emu& emu, const Config& cfg) {
+                     if (is_hotkey(x.code)) {
+                         // F pressed and let go on its own opens the menu, as SuperDrastic's does; F + a button is a
+                         // hotkey and opens nothing
+-                        if (x.value) { hot = true; hot_used = false; }
++                        if (x.value) { hot = true; hot_used = now_us() < menu_quiet_until; }
+                         else {
++                            // (a release without its press: the press closed Pixelado Party's menu)
++                            if (hot && !hot_used && menu_on) open_menu(0);
+                             hot = false;
+-                            if (!hot_used && menu_on) open_menu(0);
+                         }
+                         continue;
+                     }
+diff --git a/bananads/src/partyctl.cpp b/bananads/src/partyctl.cpp
+new file mode 100644
+index 0000000..febc9bc
+--- /dev/null
++++ b/bananads/src/partyctl.cpp
+@@ -0,0 +1,488 @@
++// See partyctl.h. The channel is only read while Party has the screen (and for a moment as it is let go of): outside
++// that, Party has nothing to say to the engine. Lines as PXROOM/1's (ROOM-PROTOCOL.md §4.2): `VERB key=value ...`,
++// values with their bytes under 0x21, '%', '=' and 0x7F as %XX.
++#include "partyctl.h"
++
++#include <cerrno>
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <map>
++#include <vector>
++
++#include <fcntl.h>
++#include <poll.h>
++#include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++namespace bananads {
++
++namespace {
++
++// how long Party has to say it has the screen once it was let go of (it tries for DRM master for 500 ms)
++constexpr int TAKE_MS = 1000;
++// with the screen Party says PING every 2 s: this long with nothing from it and it is taken for gone
++constexpr int SILENT_MS = 6000;
++// a menu button held this long while Party has the screen quits the game (ROOM-PROTOCOL.md §12.5)
++constexpr int HOLD_QUIT_MS = 3000;
++// the screen taken back: DRM master tried for this long
++constexpr int RETAKE_MS = 2000;
++
++int g_fd = -1;
++bool g_dead = false;
++std::string g_rx;
++int g_mfd = -1;            // the frame's memfd, sent with the first release and again when its size changes
++size_t g_msize = 0;
++uint8_t* g_map = nullptr;
++bool g_msent = false;
++uint64_t g_seq = 0;
++
++long long now_ms() {
++    timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return t.tv_sec * 1000LL + t.tv_nsec / 1000000;
++}
++
++std::string esc(const std::string& s) {
++    static const char hx[] = "0123456789ABCDEF";
++    std::string o;
++    for (unsigned char c : s) {
++        if (c < 0x21 || c == '%' || c == '=' || c == 0x7F) {
++            o += '%';
++            o += hx[c >> 4];
++            o += hx[c & 15];
++        } else
++            o += (char)c;
++    }
++    return o;
++}
++int hexv(int c) {
++    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
++}
++std::string unesc(const std::string& s) {
++    std::string o;
++    for (size_t i = 0; i < s.size(); i++) {
++        if (s[i] == '%' && i + 2 < s.size() && hexv((unsigned char)s[i + 1]) >= 0 && hexv((unsigned char)s[i + 2]) >= 0) {
++            o += (char)(hexv((unsigned char)s[i + 1]) * 16 + hexv((unsigned char)s[i + 2]));
++            i += 2;
++        } else
++            o += s[i];
++    }
++    return o;
++}
++
++struct Line {
++    std::string verb;
++    std::map<std::string, std::string> kv;
++    std::string str(const char* k, const char* def = "") const {
++        auto i = kv.find(k);
++        return i == kv.end() ? def : i->second;
++    }
++    long num(const char* k, long def) const {
++        auto i = kv.find(k);
++        if (i == kv.end() || i->second.empty()) return def;
++        char* e;
++        long v = strtol(i->second.c_str(), &e, 10);
++        return *e ? def : v;
++    }
++};
++Line parse(const std::string& s) {
++    Line l;
++    size_t i = 0;
++    while (i < s.size() && s[i] == ' ') i++;
++    size_t e = s.find(' ', i);
++    l.verb = s.substr(i, e == std::string::npos ? std::string::npos : e - i);
++    while (e != std::string::npos) {
++        i = e + 1;
++        e = s.find(' ', i);
++        std::string tok = s.substr(i, e == std::string::npos ? std::string::npos : e - i);
++        size_t eq = tok.find('=');
++        if (eq == std::string::npos) continue;
++        l.kv[tok.substr(0, eq)] = unesc(tok.substr(eq + 1));
++    }
++    return l;
++}
++
++// a line out (the newline added), with an fd riding on it (SCM_RIGHTS) when fd >= 0
++bool send_raw(const std::string& line, int fd = -1) {
++    if (g_fd < 0 || g_dead) return false;
++    std::string s = line + "\n";
++    if (s.size() > 1024) s = s.substr(0, 1023) + "\n";   // (§4.2's limit; nothing of ours is near it)
++    size_t off = 0;
++    while (off < s.size()) {
++        ssize_t w;
++        if (fd >= 0 && off == 0) {
++            iovec io{(void*)s.data(), s.size()};
++            char cb[CMSG_SPACE(sizeof(int))];
++            memset(cb, 0, sizeof cb);
++            msghdr mh{};
++            mh.msg_iov = &io;
++            mh.msg_iovlen = 1;
++            mh.msg_control = cb;
++            mh.msg_controllen = sizeof cb;
++            cmsghdr* c = CMSG_FIRSTHDR(&mh);
++            c->cmsg_level = SOL_SOCKET;
++            c->cmsg_type = SCM_RIGHTS;
++            c->cmsg_len = CMSG_LEN(sizeof(int));
++            memcpy(CMSG_DATA(c), &fd, sizeof(int));
++#ifdef MSG_NOSIGNAL
++            w = sendmsg(g_fd, &mh, MSG_NOSIGNAL);
++#else
++            w = sendmsg(g_fd, &mh, 0);
++#endif
++        } else {
++#ifdef MSG_NOSIGNAL
++            w = send(g_fd, s.data() + off, s.size() - off, MSG_NOSIGNAL);
++#else
++            w = send(g_fd, s.data() + off, s.size() - off, 0);
++#endif
++        }
++        if (w < 0) {
++            if (errno == EINTR) continue;
++            if (errno == EAGAIN || errno == EWOULDBLOCK) {
++                pollfd p{g_fd, POLLOUT, 0};
++                if (poll(&p, 1, 200) > 0) continue;
++            }
++            g_dead = true;
++            return false;
++        }
++        off += (size_t)w;
++    }
++    return true;
++}
++
++// what Party has sent, waiting at most ms for a first line; false: the channel is gone
++bool read_lines(int ms, std::vector<Line>& out) {
++    if (g_fd < 0 || g_dead) return false;
++    pollfd p{g_fd, POLLIN, 0};
++    int r = poll(&p, 1, ms);
++    if (r < 0 && errno != EINTR) { g_dead = true; return false; }
++    if (r <= 0) return true;
++    char b[2048];
++    for (;;) {
++        ssize_t n = recv(g_fd, b, sizeof b, MSG_DONTWAIT);
++        if (n > 0) { g_rx.append(b, (size_t)n); continue; }
++        if (n < 0 && errno == EINTR) continue;
++        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
++        g_dead = true;   // (0: Party closed its end)
++        break;
++    }
++    size_t nl;
++    while ((nl = g_rx.find('\n')) != std::string::npos) {
++        std::string l = g_rx.substr(0, nl);
++        g_rx.erase(0, nl + 1);
++        if (!l.empty() && l.back() == '\r') l.pop_back();
++        if (!l.empty()) out.push_back(parse(l));
++    }
++    if (g_rx.size() > 4096) g_rx.clear();   // (a line too long: dropped)
++    return !g_dead;
++}
++
++void hlog(PartyHost& h, const char* fmt, ...) {
++    char b[300];
++    va_list ap;
++    va_start(ap, fmt);
++    vsnprintf(b, sizeof b, fmt, ap);
++    va_end(ap);
++    h.log(b);
++}
++
++// the frame of both panels into the memfd (PXF1, ROOM-PROTOCOL.md §12.5): a new one when the size changed
++bool write_frame(PartyHost& h, bool* fresh) {
++    int w = 0, hh = 0;
++    h.panel_size(&w, &hh);
++    if (w <= 0 || hh <= 0) return false;
++    const size_t stride = (size_t)w * 4, need = 128 + 2 * stride * (size_t)hh;
++    *fresh = false;
++    if (g_mfd < 0 || g_msize != need) {
++        if (g_map) munmap(g_map, g_msize);
++        if (g_mfd >= 0) close(g_mfd);
++        g_map = nullptr;
++        g_mfd = -1;
++#ifdef __linux__
++        g_mfd = memfd_create("pixelado-frame", MFD_CLOEXEC | MFD_ALLOW_SEALING);
++#else
++        {   // (a computer without memfd: a file that is gone as soon as it is open, the same to Party)
++            char tmpl[] = "/tmp/pixelado-frame-XXXXXX";
++            g_mfd = mkstemp(tmpl);
++            if (g_mfd >= 0) unlink(tmpl);
++        }
++#endif
++        if (g_mfd < 0) return false;
++        if (ftruncate(g_mfd, (off_t)need) != 0) { close(g_mfd); g_mfd = -1; return false; }
++#ifdef F_SEAL_SHRINK
++        fcntl(g_mfd, F_ADD_SEALS, F_SEAL_SHRINK);
++#endif
++        void* m = mmap(nullptr, need, PROT_READ | PROT_WRITE, MAP_SHARED, g_mfd, 0);
++        if (m == MAP_FAILED) { close(g_mfd); g_mfd = -1; return false; }
++        g_map = (uint8_t*)m;
++        g_msize = need;
++        g_msent = false;
++    }
++    *fresh = !g_msent;
++    auto put32 = [&](size_t at, uint32_t v) { for (int i = 0; i < 4; i++) g_map[at + i] = (uint8_t)(v >> (8 * i)); };
++    memset(g_map, 0, 128);
++    memcpy(g_map, "PXF1", 4);
++    put32(4, 128);
++    put32(8, 2);
++    g_seq++;
++    for (int i = 0; i < 8; i++) g_map[16 + i] = (uint8_t)(g_seq >> (8 * i));
++    for (int s = 0; s < 2; s++) {
++        const size_t at = 24 + 24 * (size_t)s, off = 128 + (size_t)s * stride * (size_t)hh;
++        put32(at, (uint32_t)s);
++        put32(at + 4, (uint32_t)w);
++        put32(at + 8, (uint32_t)hh);
++        put32(at + 12, (uint32_t)stride);
++        put32(at + 16, 0x34325258);   // 'XR24', DRM_FORMAT_XRGB8888
++        put32(at + 20, (uint32_t)off);
++        if (!h.grab(s, (uint32_t*)(g_map + off), w, hh)) memset(g_map + off, 0, stride * (size_t)hh);
++    }
++    return true;
++}
++
++std::string lan_lines(PartyHost& h) {
++    bmenu_lan l;
++    memset(&l, 0, sizeof l);
++    const bool have = h.lan(l);
++    const char* tdls = getenv("BANANADS_LAN_TDLS");
++    char b[512];
++    std::string s;
++    snprintf(b, sizeof b, "LAN have=%d mode=%d state=%d phase=%d np=%d max=%d hp=%d nonet=%d direct=%d link=%d lstate=%d "
++             "lock=%d tdls=%d nhosts=%d", have ? 1 : 0, l.mode, l.state, l.phase, l.nplayers, l.max_players, l.host_players,
++             l.no_net, l.on_direct_net, l.link, l.link_state, h.mp_lock(), tdls && !strcmp(tdls, "1") ? 1 : 0, l.nhosts);
++    s = b;
++    s += " addr=" + esc(l.addr) + " msg=" + esc(l.msg) + "\n";
++    for (int i = 0; i < l.nplayers && i < BM_LAN_MAX; i++) {
++        snprintf(b, sizeof b, " host=%d me=%d ping=%d hold=%d", l.players[i].host, l.players[i].me, l.players[i].ping,
++                 l.players[i].hold);
++        s += "LANP name=" + esc(l.players[i].name) + b + "\n";
++    }
++    for (int i = 0; i < l.nhosts && i < BM_LAN_MAX; i++) {
++        snprintf(b, sizeof b, " players=%d max=%d", l.hosts[i].players, l.hosts[i].max);
++        s += "LANH name=" + esc(l.hosts[i].name) + " addr=" + esc(l.hosts[i].addr) + b + "\n";
++    }
++    s += "LAN_END";
++    return s;
++}
++
++void send_opts(int vol, int bri, int fps) {
++    char b[128];
++    snprintf(b, sizeof b, "OPT key=volume type=int value=%d min=0 max=100", vol);
++    send_raw(b);
++    snprintf(b, sizeof b, "OPT key=brightness type=int value=%d min=5 max=100", bri);
++    send_raw(b);
++    if (fps >= 0) {
++        snprintf(b, sizeof b, "OPT key=fps type=bool value=%d", fps ? 1 : 0);
++        send_raw(b);
++    }
++    send_raw("OPTS_END");
++}
++
++}  // namespace
++
++bool party_open(int fd, const std::string& title, int resume, const std::string& gid) {
++    party_close();
++    if (fd < 0) return false;
++    int type = 0;
++    socklen_t tl = sizeof type;
++    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) != 0 || type != SOCK_STREAM) return false;
++    fcntl(fd, F_SETFD, FD_CLOEXEC);
++    g_fd = fd;
++    g_dead = false;
++    g_rx.clear();
++    char b[160];
++    snprintf(b, sizeof b, "HELLO role=engine engine=ds proto=1 pid=%d caps=pause-own,screen resume=%d", (int)getpid(), resume);
++    return send_raw(std::string(b) + (gid.empty() ? "" : " gid=" + esc(gid)) + " title=" + esc(title));
++}
++
++bool party_up() {
++    if (g_fd < 0 || g_dead) return false;
++    // (a closed end shows as readable with nothing to read)
++    pollfd p{g_fd, POLLIN, 0};
++    if (poll(&p, 1, 0) > 0 && (p.revents & (POLLHUP | POLLERR))) g_dead = true;
++    if (!g_dead && (p.revents & POLLIN)) {
++        char c;
++        if (recv(g_fd, &c, 1, MSG_PEEK | MSG_DONTWAIT) == 0) g_dead = true;
++    }
++    return !g_dead;
++}
++
++void party_close() {
++    if (g_fd >= 0) close(g_fd);
++    g_fd = -1;
++    g_dead = false;
++    if (g_map) munmap(g_map, g_msize);
++    if (g_mfd >= 0) close(g_mfd);
++    g_map = nullptr;
++    g_mfd = -1;
++    g_msize = 0;
++    g_msent = false;
++}
++
++PartyMenu party_menu(PartyHost& h, bool ours) {
++    if (!party_up()) return PartyMenu::Unavailable;
++    {   // what Party said while it didn't have the screen (nothing expected): dropped
++        std::vector<Line> stale;
++        read_lines(0, stale);
++    }
++    bool fresh = false;
++    if (!write_frame(h, &fresh)) {
++        hlog(h, "[party] no frame for Party: our own menu\n");
++        return PartyMenu::Unavailable;
++    }
++    int vol = 50, bri = 80, fps = -1;
++    h.opts_open(&vol, &bri, &fps);
++    std::string names;
++    int hold_n = h.hold_others(names);
++    std::string lan = lan_lines(h);
++    if (!h.drop_master()) hlog(h, "[party] dropping DRM master failed (%s): Party may not get it\n", strerror(errno));
++    // what Party needs to draw first, then the screen
++    send_opts(vol, bri, fps);
++    send_raw(lan);
++    send_raw("HOLD n=" + std::to_string(hold_n) + " names=" + esc(names));
++    char b[96];
++    snprintf(b, sizeof b, "SCREEN state=released reason=%s seq=%llu", ours ? "menu" : "hold", (unsigned long long)g_seq);
++    if (!send_raw(b, fresh ? g_mfd : -1)) {
++        h.take_master(RETAKE_MS);
++        hlog(h, "[party] Party is gone: our own menu\n");
++        return PartyMenu::Unavailable;
++    }
++    if (fresh) g_msent = true;
++    hlog(h, "[party] the screen to Party (%s)\n", ours ? "our menu" : "another player's menu");
++
++    const long long t0 = now_ms();
++    long long heard = t0, ticked = t0, lan_at = t0, hold_at = t0;
++    bool taken = false, held = ours, wanted = false, quitting = false;
++    PartyMenu out = PartyMenu::Done;
++    for (;;) {
++        std::vector<Line> in;
++        const bool alive = read_lines(10, in);
++        const long long t = now_ms();
++        if (!in.empty()) heard = t;
++        bool give = false;
++        for (const Line& l : in) {
++            if (l.verb == "SCREEN") {
++                const std::string st = l.str("state");
++                if (st == "taken") taken = true;
++                else if (st == "failed") {
++                    hlog(h, "[party] Party couldn't take the screen (%s): our own menu\n", l.str("reason", "?").c_str());
++                    out = PartyMenu::Fallback;
++                    give = true;
++                } else if (st == "give") give = true;
++            } else if (l.verb == "CMD") {
++                const std::string op = l.str("op");
++                if (op == "set") {
++                    h.opt_set(l.str("key"), (int)l.num("value", 0));
++                    send_raw("OK op=set key=" + esc(l.str("key")));
++                } else if (op == "lan") {
++                    h.lan_set((int)l.num("mode", 0), (int)l.num("players", 0), l.str("addr"));
++                    send_raw("OK op=lan");
++                    lan_at = 0;   // (the new state soon)
++                } else if (op == "quit") {
++                    hlog(h, "[party] quit from Party's menu\n");
++                    send_raw("OK op=quit");
++                    quitting = true;
++                } else if (op == "resume") {
++                    send_raw("OK op=resume");
++                } else
++                    send_raw("ERR op=" + esc(op) + " msg=unknown");
++            } else if (l.verb == "HOLD") {
++                const bool on = l.str("state") == "on";
++                if (on != held) {
++                    h.hold_set(on);
++                    held = on;
++                    wanted = false;
++                    hlog(h, "[party] %s\n", on ? "our menu opened in Party (the room held)" : "our menu closed in Party");
++                }
++            } else if (l.verb == "SOUND") {
++                const std::string id = l.str("id");
++                h.sound(id == "select" ? 1 : id == "back" ? 2 : 0);
++            } else if (l.verb == "PING") {
++                send_raw("PONG t=" + esc(l.str("t")));
++            }
++        }
++        if (quitting) {
++            h.opts_close();
++            if (held) h.hold_set(false);
++            h.quit();
++            return PartyMenu::Quit;
++        }
++        if (give) break;
++        if (!alive) {
++            hlog(h, "[party] Party went away with the screen: taken back\n");
++            out = PartyMenu::Fallback;
++            break;
++        }
++        if (h.stopping()) {   // (SIGTERM, END: the frontend quits; the kernel hands the screen on when we exit)
++            if (held) h.hold_set(false);
++            h.opts_close();
++            return PartyMenu::Quit;
++        }
++        if (!taken && t - t0 > TAKE_MS) {
++            hlog(h, "[party] Party didn't take the screen in %d ms: our own menu\n", TAKE_MS);
++            out = PartyMenu::Fallback;
++            break;
++        }
++        if (taken && t - heard > SILENT_MS) {
++            hlog(h, "[party] nothing from Party in %d s: the screen taken back\n", SILENT_MS / 1000);
++            out = PartyMenu::Fallback;
++            break;
++        }
++        if (h.menu_held_ms() >= HOLD_QUIT_MS) {
++            hlog(h, "[party] the menu button held 3 s while Party had the screen: quit\n");
++            h.take_master(RETAKE_MS);
++            if (held) h.hold_set(false);
++            h.opts_close();
++            h.quit();
++            return PartyMenu::Quit;
++        }
++        // the room's pause by the others, for the wait screen; over (and not ours): the screen wanted back
++        if (t - hold_at >= 30) {
++            hold_at = t;
++            std::string n2;
++            const int k = h.hold_others(n2);
++            if (k != hold_n || n2 != names) {
++                hold_n = k;
++                names = n2;
++                send_raw("HOLD n=" + std::to_string(hold_n) + " names=" + esc(names));
++            }
++            if (!held && hold_n <= 0 && !wanted) {
++                wanted = send_raw("SCREEN state=want");
++                hlog(h, "[party] the room's pause is over: the screen asked back\n");
++            }
++        }
++        if (t - lan_at >= 500) {
++            lan_at = t;
++            std::string l2 = lan_lines(h);
++            if (l2 != lan) { lan = l2; send_raw(lan); }
++        }
++        if (t - ticked >= 500) {
++            ticked = t;
++            int v = vol, br = bri;
++            if (h.opts_tick(&v, &br) && (v != vol || br != bri)) {
++                vol = v;
++                bri = br;
++                send_opts(vol, bri, fps);
++            }
++        }
++    }
++    // the screen back
++    h.opts_close();
++    // (our own menu next keeps our hold of the room: it is ours again at once; the wait screen next lets it go)
++    if (held && (out != PartyMenu::Fallback || !ours)) {
++        h.hold_set(false);
++        held = false;
++    }
++    if (!h.take_master(RETAKE_MS)) hlog(h, "[party] DRM master not back in %d ms (%s); trying anyway\n", RETAKE_MS, strerror(errno));
++    h.repaint();
++    if (out == PartyMenu::Done) send_raw("SCREEN state=taken");
++    hlog(h, "[party] the screen is back (%s)\n", out == PartyMenu::Done ? "Party's menu closed" : "our own menu next");
++    return out;
++}
++
++}  // namespace bananads
+diff --git a/bananads/src/partyctl.h b/bananads/src/partyctl.h
+new file mode 100644
+index 0000000..95bfb31
+--- /dev/null
++++ b/bananads/src/partyctl.h
+@@ -0,0 +1,70 @@
++// Pixelado Party's channel (ROOM-PROTOCOL.md §12.2, §12.5): when Party runs the engine as its child, it hands it one
++// end of a socketpair (party.fd=<fd>, or PIXELADO_PARTY_FD). The in-game menu and the "X is in the menu" screen are
++// then Party's: at a menu (ours, or another player's holding the room) the engine pauses, writes the last frame of both
++// panels into a memfd (PXF1), lets go of DRM master and says SCREEN released; Party draws over that frame and gives the
++// screen back (SCREEN give). The menu's settings (volume, brightness, the FPS counter), the local wireless page and the
++// quit come back as CMD lines and are done here, as the engine's own menu does them.
++//
++// No channel, a channel that is gone, or a Party that doesn't answer in time: party_menu says so (Fallback or
++// Unavailable) and the frontend opens its own menu (BananaDS's menu.c) instead, so a game is never left without one.
++//
++// Nothing here knows the display or the emulator: the frontend gives them through PartyHost (so it builds and is
++// tested on a computer, dev/party-test in pixelado-party).
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++#include "menu.h"
++
++namespace bananads {
++
++struct PartyHost {
++    virtual ~PartyHost() = default;
++    // DRM master: let go; take it back (tried every 10 ms for up to ms). false: couldn't
++    virtual bool drop_master() = 0;
++    virtual bool take_master(int ms) = 0;
++    // the panel as it was last shown (0 top, 1 bottom), at the panel's size: XRGB8888 rows of w pixels
++    virtual void panel_size(int* w, int* h) = 0;
++    virtual bool grab(int panel, uint32_t* dst, int w, int h) = 0;
++    // after the screen came back: the game's last frame on both panels again (a full modeset)
++    virtual void repaint() = 0;
++    // the room's pause (Emu::room_hold_set / room_hold_others / room_hold_names)
++    virtual void hold_set(bool on) = 0;
++    virtual int hold_others(std::string& names) = 0;
++    // the local wireless page (menu.h's lan_get / lan_set / mp_lock); lan false: no LAN in this build
++    virtual bool lan(bmenu_lan& st) = 0;
++    virtual void lan_set(int mode, int max_players, const std::string& addr) = 0;
++    virtual int mp_lock() = 0;
++    // the menu's settings: as the menu opens (fps -1: no FPS counter), a change, a tick while it is open (1: the
++    // handheld's keys moved the volume or the brightness), and its close (the brightness saved)
++    virtual void opts_open(int* vol, int* bri, int* fps) = 0;
++    virtual void opt_set(const std::string& key, int v) = 0;
++    virtual int opts_tick(int* vol, int* bri) = 0;
++    virtual void opts_close() = 0;
++    virtual void sound(int id) = 0;   // 0 move, 1 select, 2 back (the menu's WAVs, on the engine's sound device)
++    virtual void quit() = 0;          // the player quit from Party's menu (after it the frontend quits, as menu's quit)
++    // while Party has the screen: the engine's own input read and thrown away; how long a menu button (F, HOME, F2,
++    // L3) has been held, ms (0: none). Held 3 s: the game quits (Party may have crashed with the screen)
++    virtual int menu_held_ms() = 0;
++    virtual bool stopping() = 0;      // the process is shutting down (SIGTERM, END)
++    virtual void log(const char* line) = 0;
++};
++
++// fd: the channel (from party.fd); title: the game's name as the menu shows it; resume: the quit writes the resume
++// state. Says HELLO. false: no channel (the fd isn't a socket, or is closed)
++bool party_open(int fd, const std::string& title, int resume, const std::string& gid);
++bool party_up();     // the channel is there and Party hasn't gone
++void party_close();
++
++enum class PartyMenu {
++    Unavailable,   // no channel, or Party gone: the screen was never let go of; open the engine's own menu
++    Done,          // Party gave the screen back (the menu closed, or the room's pause is over); repainted
++    Quit,          // the player quit in Party's menu: Party keeps the screen, the frontend quits
++    Fallback,      // Party didn't answer in time or went away while it had the screen: taken back; open our own menu
++};
++// ours: our menu (the room held by us already); else another player's menu holds the room (the wait screen).
++// Blocks the caller (the presenter's thread) while Party has the screen.
++PartyMenu party_menu(PartyHost& h, bool ours);
++
++}  // namespace bananads

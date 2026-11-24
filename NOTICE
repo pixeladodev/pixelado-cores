@@ -1,0 +1,23 @@
+Pixelado cores
+==============
+
+The engines Pixelado Party runs to play games, each one a program of its own. Distributed under the
+GNU General Public License v3 (LICENSE). The changes are the patches and scripts in this repository,
+made by Pixelado Dev from November 2026.
+
+ds/ (pixelado-core-ds) is a modified version of BananaDS, itself built on melonDS:
+
+- BananaDS: the bananads/ directory of SuperDrastic, https://github.com/JorreFog/SuperDrastic
+  Copyright (c) 2026 JorreFog and contributors. GPLv3.
+- melonDS: https://github.com/melonDS-emu/melonDS
+  Copyright (c) Arisotura and the melonDS contributors. GPLv3.
+- ENet (linked into the binary): Copyright (c) 2002-2024 Lee Salzman. MIT.
+- ds/build/apply-patches.sh: from Buildroot 2026.02.3, (c) 2002 Erik Andersen. GPLv2+.
+
+The DS binary is built with the Bootlin aarch64 glibc toolchain (stable-2025.08-1) and links the
+console's glibc, libdrm and alsa-lib; libstdc++ and libgcc are linked in statically (GCC runtime
+library exception).
+
+The cores contain no BIOS, firmware or games, and are not affiliated with Nintendo, BananaOS,
+BananaDS or melonDS. "Pixelado" and its logos are names of Pixelado Dev; the GPL covers the code here,
+not the right to use those names for another product.

@@ -1,0 +1,68 @@
+From: Pixelado Dev <350114043+pixeladodev@users.noreply.github.com>
+Subject: [PATCH] kms lowlat: the newest frame's vblank on the deadlines' grid
+
+tail_vbl() put the frame waiting for the panels at the top panel's vblank,
+while the deadlines it is compared with (deadline_after) are on the earlier
+panel's grid. With the bottom panel's vblank more than ~6.8 ms before the
+top's (half a refresh less the 1.5 ms margin) every frame was aimed a refresh
+later than it could be: a steady 30 fps with the emulator idle half the time,
+each frame counted late, and cpugov ignoring them as "the game isn't running".
+The panels' phase is whatever lit them; an RG DS launched from Pixelado
+Party's own room had -7.9 ms. shown_vbl and the queue's vblanks are now on the
+earlier panel's grid.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/bananads/src/frontend_kms.cpp b/bananads/src/frontend_kms.cpp
+index 2c80b00..1b744aa 100644
+--- a/bananads/src/frontend_kms.cpp
++++ b/bananads/src/frontend_kms.cpp
+@@ -281,25 +281,30 @@ struct Display {
+     long long wake_at = 0;               // kms.lowlat: the presenter's next wake-up for a frame held to its window             // the top panel's vblank at which the last frame went on screen
+     // (mu held) the vblank at which the newest frame not on screen yet will be: the frames waiting go one a refresh
+     // after the last one shown, and none before the next vblank from now
++    // All on the deadlines' grid (deadline_after's): the earlier panel's vblanks. On the top panel's, a bottom panel
++    // vblank-ing more than ~6.8 ms before the top's (half a refresh less the margin) put the newest frame's vblank a
++    // refresh past the next deadline, every frame: each aimed a refresh later, 30 frames a second with the emulator
++    // idle half the time, each counted late (RG DS, Mario Kart DS in a Pixelado room, the bottom panel at -7.9 ms)
+     long long tail_vbl(long long now) const {
+         int n = 0;
+         for (int i = 0; i < NB; i++) n += state[i] == QUEUED || state[i] == COMMITTED;
++        const long long off = (long long)std::min(0.0, bot_off), base = vbl_top + off;
+         long long shown = shown_vbl;
+         // between the pair's two flip events the committed frame is on screen already (at the first one's vblank):
+         // counted as waiting, the next frame was aimed a refresh too late (a repeat each time, 16-27 a minute)
+-        if (pending == 1 && committed >= 0) { n--; shown = std::max(shown, first_ev ? first_ev : vbl_top); }
++        if (pending == 1 && committed >= 0) { n--; shown = std::max(shown, first_ev ? first_ev : base); }
+         // ...and so it is once the vblank after its commit has passed, before the flip events have come (they come
+         // ~0.1-0.5 ms after the vblank): a frame published in that gap counted the one on screen as waiting and was
+         // aimed a refresh later, a repeat and a frame of sound lost each time (RG DS, Mario Kart DS: 5 of 6 repeats
+         // a minute, the sound's backlog run dry and stretched to 0.90). (A commit 1 ms before a vblank makes it.)
+         else if (pending == 2 && committed >= 0 && commit_us && vbl_top) {
+-            const double k = std::ceil((double)(commit_us + 1000 - vbl_top) / period_us);   // (the top's grid; the
+-            const long long v = vbl_top + (long long)(std::max(1.0, k) * period_us + std::min(0.0, bot_off));  // earlier panel's)
++            const double k = std::ceil((double)(commit_us + 1000 - base) / period_us);
++            const long long v = base + (long long)(std::max(1.0, k) * period_us);
+             if (now >= v) { n--; shown = std::max(shown, v); }
+         }
+         if (n <= 0 || !shown) return 0;
+-        const double k = std::ceil((double)(now - vbl_top) / period_us);   // the next vblank after now
+-        const long long next_vbl = vbl_top + (long long)(std::max(1.0, k) * period_us);
++        const double k = std::ceil((double)(now - base) / period_us);   // the next vblank after now
++        const long long next_vbl = base + (long long)(std::max(1.0, k) * period_us);
+         return std::max(shown + (long long)(n * period_us), next_vbl + (long long)((n - 1) * period_us));
+     }
+     double ll_lead_sum = 0;              // ...and how far before it the on-time ones were (us)
+@@ -1374,7 +1379,11 @@ struct Display {
+                     commit_aim = 0;
+                 }
+                 if (committed >= 0) {
+-                    shown_vbl = vbl_top;
++                    // the pair's vblank on the deadlines' grid (tail_vbl's): the earlier panel's at or just before
++                    // this, its last event (the top's own vblank was a refresh late for it with the bottom panel's
++                    // vblank over ~6.8 ms before the top's)
++                    const double b = (double)vbl_top + std::min(0.0, bot_off);
++                    shown_vbl = (long long)(b + std::floor(((double)kt - b + 1000) / period_us) * period_us);
+                     if (Trace* x = tr(committed)) x->flip = first_ev;
+                     if (const long long a = aim_us[committed]) {   // shown after the vblank it aimed at?
+                         const double late = (double)(first_ev - a) - margin_us;

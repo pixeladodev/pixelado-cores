@@ -1,0 +1,143 @@
+From: Pixelado Dev <350114043+pixeladodev@users.noreply.github.com>
+Subject: [PATCH] Wifi: diag-cmd-window, the room a MP host's CMD has and what the replies repeat (diagnostics only, BANANADS_LAN_TIMEOUT_MS)
+
+
+---
+diff --git a/src/Wifi.cpp b/src/Wifi.cpp
+index b0af1ba..7d0f261 100644
+--- a/src/Wifi.cpp
++++ b/src/Wifi.cpp
+@@ -290,6 +290,99 @@ static inline void SlotWrite() { if (Pending) NSlotW++; }
+ static inline void RamWrite(u16 a) { if (Pending && a + 2 > BufLo && a < BufHi) NBufW++; }
+ }
+ 
++// BananaDS diag-cmd-window (BANANADS_LAN_TIMEOUT_MS set; diagnostics only, behavior unchanged): as a MP host, how
++// much room the game leaves each CMD exchange and what the clients answer. The room ("slack") is CmdCounter, the
++// W_CMD_COUNT window the game armed, less the exchange's emulated duration when the CMD starts: the time a real
++// DS could hold the CMD back (a busy channel) and still finish in the window. If it is larger than the network's
++// round trip, the CMD could be sent to the clients at once and its emulated exchange held until the reply is in.
++// The replies: how many are the same as that client's previous one (the 802.11 body, less the sequence number),
++// and how many are empty. A line a second, "[diag] LAN cmd".
++namespace cdiag
++{
++static int On()
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("BANANADS_LAN_TIMEOUT_MS"); v = (e && *e) ? 1 : 0; }
++    return v;
++}
++static int NCmd, NFail, NTimeout, NClients, NNoRoom, NSlack, NRep, NSame, NEmpty;
++static int Bucket[6];   // slack: <0.5, 0.5-1, 1-2, 2-4, 4-8, >=8 ms
++static s64 SlackMin, SlackMax, SlackSum, CntMin, CntMax, CntSum, GapSum;
++static int NGap;
++static u64 LenSum, LastStart, WinStart;
++static u32 LastHash[16];
++static bool HaveHash[16];
++
++static u32 Hash(const u8* p, int n)
++{
++    u32 h = 2166136261u;
++    for (int i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
++    return h;
++}
++
++static void Flush()
++{
++    const u64 t = Platform::GetMSCount();
++    if (!WinStart) WinStart = t;
++    if (t - WinStart < 1000) return;
++    if (NCmd)
++        Log(LogLevel::Info, "[diag] LAN cmd: n=%d fail=%d timeout=%d clients=%.2f len=%.0f gap_us=%.0f; cmdcount_us min=%lld "
++            "mean=%.0f max=%lld; slack_us min=%lld mean=%.0f max=%lld noroom=%d; slack_ms <0.5=%d 0.5-1=%d 1-2=%d 2-4=%d "
++            "4-8=%d >=8=%d; replies=%d same=%d empty=%d\n",
++            NCmd, NFail, NTimeout, (double)NClients / NCmd, (double)LenSum / NCmd, NGap ? (double)GapSum / NGap : 0.0,
++            (long long)CntMin, (double)CntSum / NCmd, (long long)CntMax,
++            (long long)(NSlack ? SlackMin : 0), NSlack ? (double)SlackSum / NSlack : 0.0, (long long)(NSlack ? SlackMax : 0),
++            NNoRoom, Bucket[0], Bucket[1], Bucket[2], Bucket[3], Bucket[4], Bucket[5], NRep, NSame, NEmpty);
++    NCmd = NFail = NTimeout = NClients = NNoRoom = NSlack = NRep = NSame = NEmpty = NGap = 0;
++    for (int& b : Bucket) b = 0;
++    SlackMin = SlackMax = SlackSum = CntMin = CntMax = CntSum = GapSum = 0;
++    LenSum = 0;
++    WinStart = t;
++}
++
++static void Start(u32 cmdcounter, u32 duration, u64 ts, int clients, int len)
++{
++    if (!On()) return;
++    const s64 cnt = cmdcounter, slack = (s64)cmdcounter - (s64)duration;
++    if (!NCmd || cnt < CntMin) CntMin = cnt;
++    if (!NCmd || cnt > CntMax) CntMax = cnt;
++    CntSum += cnt;
++    NCmd++; NClients += clients; LenSum += len;
++    if (LastStart && ts > LastStart) { GapSum += (s64)(ts - LastStart); NGap++; }
++    LastStart = ts;
++    if (slack <= 100) NNoRoom++;   // (StartTX_Cmd's own test: not enough room, the transfer fails at once)
++    else
++    {
++        if (!NSlack || slack < SlackMin) SlackMin = slack;
++        if (!NSlack || slack > SlackMax) SlackMax = slack;
++        SlackSum += slack; NSlack++;
++        const int b = slack < 500 ? 0 : slack < 1000 ? 1 : slack < 2000 ? 2 : slack < 4000 ? 3 : slack < 8000 ? 4 : 5;
++        Bucket[b]++;
++    }
++}
++
++static void End(bool failed, bool timeout)
++{
++    if (!On()) return;
++    if (failed) NFail++;
++    if (timeout) NTimeout++;
++    Flush();
++}
++
++static void Reply(int client, const u8* reply)
++{
++    if (!On() || client < 1 || client > 15) return;
++    const int len = *(const u16*)&reply[10];
++    const u16 framectl = *(const u16*)&reply[12];
++    NRep++;
++    if (len <= 28 || (framectl & 0x00F0) == 0x0050) NEmpty++;   // (an empty reply: CF-Ack with no data)
++    u32 h = Hash(&reply[12], 22);   // the 802.11 header up to the sequence control
++    if (len > 24) h ^= Hash(&reply[12 + 24], std::min(len - 24, 1000)) * 31u;
++    if (HaveHash[client] && LastHash[client] == h) NSame++;
++    LastHash[client] = h; HaveHash[client] = true;
++}
++}
++
+ namespace diag
+ {
+ struct Rate { u64 Start; int N; int Held; };
+@@ -1087,6 +1180,8 @@ void Wifi::StartTX_Cmd()
+     duration += 112 + ((10 + IOPORT(W_CmdReplyTime)) * NumClients(MPClientMask));
+     duration += (32 * (slot->Rate==2 ? 4:8));
+ 
++    cdiag::Start(CmdCounter, duration, USTimestamp, NumClients(MPClientMask), slot->Length);
++
+     if (CmdCounter > (duration + 100))
+     {
+         slot->CurPhase = 0;
+@@ -1534,6 +1629,8 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
+                 SetIRQ(1);
+             }
+ 
++            cdiag::End(MPClientFail != 0, false);
++
+             if (MPClientFail && false)
+             {
+                 // if some clients failed to respond: try again
+@@ -1556,6 +1653,7 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
+ 
+     case 13: // MP transfer failed (timeout)
+         {
++            cdiag::End(true, true);
+             IOPORT(W_TXBusy) &= ~(1<<1);
+             IOPORT(W_TXSlotCmd) &= 0x7FFF;
+ 
+@@ -1930,6 +2028,7 @@ void Wifi::MPClientReplyRX(int client)
+ 
+     u8* reply = &MPClientReplies[(client-1)*1024];
+     framelen = *(u16*)&reply[10];
++    cdiag::Reply(client, reply);
+ 
+     txrate = reply[8];
+ 
