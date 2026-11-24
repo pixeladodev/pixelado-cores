@@ -4,6 +4,10 @@
 # build
 /ds/.cache/
 /ds/dist/
+/gba/.cache/
+/gba/dist/
+/retro/build/
+/common/build/
 # Python
 __pycache__/
 *.py[cod]

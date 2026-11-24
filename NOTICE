@@ -14,10 +14,21 @@ ds/ (pixelado-core-ds) is a modified version of BananaDS, itself built on melonD
 - ENet (linked into the binary): Copyright (c) 2002-2024 Lee Salzman. MIT.
 - ds/build/apply-patches.sh: from Buildroot 2026.02.3, (c) 2002 Erik Andersen. GPLv2+.
 
+gba/ (pixelado-core-gba) is gpSP built into this repository's own libretro frontend (retro/, common/):
+
+- gpSP (gameplaySP): https://github.com/libretro/gpsp
+  Copyright (c) 2006 Exophase, (c) 2021-2025 David Guillen Fandos, and the gpSP contributors.
+  GPL-2.0-or-later (combined here under the GPL v3). It carries an open-source replacement for the GBA's BIOS,
+  (c) 2002-2013 the VBA and VBA-M teams and Normmatt, GPL-2.0-or-later.
+- libretro.h (retro/include/): Copyright (c) 2010-2020 The RetroArch team. MIT.
+
 The DS binary is built with the Bootlin aarch64 glibc toolchain (stable-2025.08-1) and links the
 console's glibc, libdrm and alsa-lib; libstdc++ and libgcc are linked in statically (GCC runtime
 library exception).
 
-The cores contain no BIOS, firmware or games, and are not affiliated with Nintendo, BananaOS,
-BananaDS or melonDS. "Pixelado" and its logos are names of Pixelado Dev; the GPL covers the code here,
+The GBA binary is built with the same toolchain and links the console's glibc, libdrm and alsa-lib; libgcc is
+linked in statically.
+
+The cores contain no BIOS, firmware or games from Nintendo, and are not affiliated with Nintendo, BananaOS,
+BananaDS, melonDS, gpSP or libretro. "Pixelado" and its logos are names of Pixelado Dev; the GPL covers the code here,
 not the right to use those names for another product.
