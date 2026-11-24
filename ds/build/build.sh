@@ -26,4 +26,9 @@ docker run --rm --platform linux/amd64 --cpus="$CPUS" \
     -e PIXELADO_CORE_JOBS="$JOBS" -e PIXELADO_CORE_DRAFT="${PIXELADO_CORE_DRAFT:-}" -e PIXELADO_CORE_UNSTRIPPED="${PIXELADO_CORE_UNSTRIPPED:-}" -e PIXELADO_CORE_GENGIS="${PIXELADO_CORE_GENGIS:-1}" \
     -v "$ROOT:/core" -v "$CACHE:/opt" -v "$SRC:/tmp/vmac/src" -w /core \
     "$IMAGE" bash build/release-build.sh
+# On Linux the container writes dist/ as root: hand it back to this user so package.sh can write the zip
+# (Docker Desktop on a Mac maps ownership already)
+if [ -d "$ROOT/dist" ] && [ ! -w "$ROOT/dist" ]; then
+    docker run --rm -v "$ROOT:/core" "$IMAGE" chown -R "$(id -u):$(id -g)" /core/dist
+fi
 "$ROOT/build/package.sh"
