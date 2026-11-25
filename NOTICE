@@ -5,16 +5,16 @@ The engines Pixelado Party runs to play games, each one a program of its own. Di
 GNU General Public License v3 (LICENSE). The changes are the patches and scripts in this repository,
 made by Pixelado Dev from November 2026.
 
-ds/ (pixelado-core-ds) is a modified version of BananaDS, itself built on melonDS:
+cores/nds/bananads/ (pixelado-core-bananads) is a modified version of BananaDS, itself built on melonDS:
 
 - BananaDS: the bananads/ directory of SuperDrastic, https://github.com/JorreFog/SuperDrastic
   Copyright (c) 2026 JorreFog and contributors. GPLv3.
 - melonDS: https://github.com/melonDS-emu/melonDS
   Copyright (c) Arisotura and the melonDS contributors. GPLv3.
 - ENet (linked into the binary): Copyright (c) 2002-2024 Lee Salzman. MIT.
-- ds/build/apply-patches.sh: from Buildroot 2026.02.3, (c) 2002 Erik Andersen. GPLv2+.
+- cores/nds/bananads/build/apply-patches.sh: from Buildroot 2026.02.3, (c) 2002 Erik Andersen. GPLv2+.
 
-gba/ (pixelado-core-gba) is gpSP built into this repository's own libretro frontend (retro/, common/):
+cores/gba/gpsp/ (pixelado-core-gpsp) is gpSP built into this repository's own libretro frontend (retro/, common/):
 
 - gpSP (gameplaySP): https://github.com/libretro/gpsp
   Copyright (c) 2006 Exophase, (c) 2021-2025 David Guillen Fandos, and the gpSP contributors.
@@ -30,5 +30,5 @@ The GBA binary is built with the same toolchain and links the console's glibc, l
 linked in statically.
 
 The cores contain no BIOS, firmware or games from Nintendo, and are not affiliated with Nintendo, BananaOS,
-BananaDS, melonDS, gpSP or libretro. "Pixelado" and its logos are names of Pixelado Dev; the GPL covers the code here,
-not the right to use those names for another product.
+BananaDS, SuperDrastic, melonDS, gpSP or libretro. "Pixelado" and its logos are names of Pixelado Dev; the GPL
+covers the code here, not the right to use those names for another product.

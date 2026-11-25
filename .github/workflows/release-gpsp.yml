@@ -1,0 +1,49 @@
+name: release-gpsp
+
+on:
+  push:
+    tags:
+      - "gpsp-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (the binary must match binary_sha in cores/gba/gpsp/manifest)
+        run: cores/gba/gpsp/build/build.sh
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          core=cores/gba/gpsp
+          ver=$(sed -n 's/^version=//p' "$core/manifest" | head -n 1 | tr -d '\r')
+          tag="$GITHUB_REF_NAME"
+          [ "$tag" = "gpsp-v$ver" ] || { echo "the tag ($tag) is not gpsp-v$ver" >&2; exit 1; }
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists on GitHub." >&2
+            exit 1
+          fi
+          notes=$(mktemp)
+          cat > "$notes" <<EOF
+          The Game Boy Advance core for Pixelado Party: \`pixelado-core-gpsp $ver\`.
+
+          A program of its own (Party starts it as a separate process): **gpSP** (libretro's,
+          with its arm64 recompiler) on this repository's own libretro frontend (\`retro/\`), with
+          the link cable and the wireless adapter played over the network, the room's pause and
+          the screen handed to Party.
+
+          Licence: **GPL-3.0-or-later** (gpSP is GPL-2.0-or-later, combined here under the
+          GPL v3). Source: <https://github.com/pixeladodev/pixelado-cores/tree/$tag/$core>
+          (the credits are in \`NOTICE\`).
+          EOF
+          gh release create "$tag" \
+            "$core/dist/pixelado-core-gpsp-$ver.zip" \
+            "$core/dist/SHA256SUMS" \
+            --title "pixelado-core-gpsp $ver" \
+            --notes-file "$notes"

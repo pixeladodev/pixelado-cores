@@ -1,4 +1,4 @@
-/* See pixelado/roomctl.h. A C version of the DS core's roomctl.cpp (ds/patches/bananads 0006), without its thread. */
+/* See pixelado/roomctl.h. A C version of the DS core's roomctl.cpp (cores/nds/bananads/patches/bananads 0006), without its thread. */
 #include "pixelado/roomctl.h"
 #include "pixelado/line.h"
 

@@ -1,6 +1,6 @@
 # retro: pixelado-retro, the minimal libretro frontend
 
-The frontend the retro cores are built on (`pixelado-core-gba` today, `-snes` later). Not RetroArch: one libretro core
+The frontend the retro cores are built on (`pixelado-core-gpsp` today, `-snes` later). Not RetroArch: one libretro core
 linked in statically, the handheld's panels, sound and buttons, the link between the handhelds, and Pixelado Party's
 channel (`common/`). About 3,000 lines of C99.
 
@@ -78,7 +78,7 @@ pixelado-core-<sys> [options] ROM
 ## Build and test
 
 ```sh
-make -C retro SYS=gba CORE_LIB=/path/libgpsp.a VERSION=0.1.0     # gba/build/ does this for the handhelds
+make -C retro SYS=gba NAME=gpsp CORE_LIB=/path/libgpsp.a VERSION=0.1.1   # cores/gba/gpsp/build/ does this for the handhelds
 make -C retro fake test                                           # the loopback test with the fake core (a Mac too)
 python3 retro/tests/party_room.py retro/build/pixelado-core-fake  # two cores with a scripted Party and room
 ```

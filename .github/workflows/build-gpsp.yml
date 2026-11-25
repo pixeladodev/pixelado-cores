@@ -1,0 +1,38 @@
+name: build-gpsp
+
+on:
+  push:
+    branches: [main]
+    paths: ['cores/gba/gpsp/**', 'retro/**', 'common/**', '!**/*.md', 'NOTICE', 'LICENSE', '.github/workflows/build-gpsp.yml']
+  pull_request:
+    paths: ['cores/gba/gpsp/**', 'retro/**', 'common/**', '!**/*.md']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (the binary must match binary_sha in cores/gba/gpsp/manifest)
+        run: cores/gba/gpsp/build/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pixelado-core-gpsp-${{ github.run_number }}
+          path: |
+            cores/gba/gpsp/dist/pixelado-core-gpsp-*.zip
+            cores/gba/gpsp/dist/SHA256SUMS
+          if-no-files-found: error
+
+  test:
+    # the tests run in an arm64 container: gpSP's arm64 recompiler as on the handhelds, two cores linked over TCP
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: common, retro (fake core), gpSP's link with the test ROM
+        run: cores/gba/gpsp/tests/run.sh

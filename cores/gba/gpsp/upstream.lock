@@ -1,0 +1,5 @@
+# What pixelado-core-gpsp is built on. build/fetch-sources.sh reads it; nothing else is downloaded for the emulator.
+# gpSP (libretro's, GPL-2.0-or-later): 5819380, the gpSP that BananaOS 0.5.3.x packages (libretro-gpsp), with its link
+# over libretro's netpacket interface (the GBA Wireless Adapter, and the Pokemon and Advance Wars cable protocols).
+gpsp_repo=https://github.com/libretro/gpsp
+gpsp=5819380c2ffb0900219d700a382ee68c464ebb99

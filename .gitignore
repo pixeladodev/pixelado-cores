@@ -2,12 +2,12 @@
 .DS_Store
 ._*
 # build
-/ds/.cache/
-/ds/dist/
-/gba/.cache/
-/gba/dist/
+/cores/*/*/.cache/
+/cores/*/*/dist/
 /retro/build/
 /common/build/
+/snes/.cache/
+/snes/dist/
 # Python
 __pycache__/
 *.py[cod]

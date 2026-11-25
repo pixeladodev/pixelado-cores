@@ -1,0 +1,47 @@
+name: release-bananads
+
+on:
+  push:
+    tags:
+      - "bananads-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (the binary must match binary_sha in cores/nds/bananads/manifest)
+        run: cores/nds/bananads/build/build.sh
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          core=cores/nds/bananads
+          ver=$(sed -n 's/^version=//p' "$core/manifest" | head -n 1 | tr -d '\r')
+          tag="$GITHUB_REF_NAME"
+          [ "$tag" = "bananads-v$ver" ] || { echo "the tag ($tag) is not bananads-v$ver" >&2; exit 1; }
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists on GitHub." >&2
+            exit 1
+          fi
+          notes=$(mktemp)
+          cat > "$notes" <<EOF
+          The Nintendo DS core for Pixelado Party: \`pixelado-core-bananads $ver\`.
+
+          A program of its own (Party starts it as a separate process), built on **BananaDS**
+          (from SuperDrastic) on **melonDS**, with local wireless play over the network, DS
+          Download Play, the room's pause and the screen handed to Party for its menu.
+
+          Licence: **GPL-3.0-or-later**. Source: <https://github.com/pixeladodev/pixelado-cores/tree/$tag/$core>
+          (the credits are in \`NOTICE\`).
+          EOF
+          gh release create "$tag" \
+            "$core/dist/pixelado-core-bananads-$ver.zip" \
+            "$core/dist/SHA256SUMS" \
+            --title "pixelado-core-bananads $ver" \
+            --notes-file "$notes"

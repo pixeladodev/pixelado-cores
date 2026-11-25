@@ -6,21 +6,22 @@ never links or loads a core.
 
 | Folder | Core | What |
 |---|---|---|
-| [`ds/`](ds/) | `pixelado-core-ds` | Nintendo DS: BananaDS (from SuperDrastic) on melonDS, with local wireless play over the network, DS Download Play, the room's pause and the screen handed to Party for its menu |
-| [`gba/`](gba/) | `pixelado-core-gba` | Game Boy Advance: gpSP on `retro/`, with the link cable and the wireless adapter played over the network, the room's pause and the screen handed to Party |
+| `cores/<sistema>/<core>/` | | one core per folder: the system (`nds`, `gba`, `snes`) and the core (its emulator, with its profile when it has one: `bsnes-mercury`, `beetle-supafaust`). A system may have several cores |
+| [`cores/nds/bananads/`](cores/nds/bananads/) | `pixelado-core-bananads` | Nintendo DS: BananaDS (from SuperDrastic) on melonDS, with local wireless play over the network, DS Download Play, the room's pause and the screen handed to Party for its menu |
+| [`cores/gba/gpsp/`](cores/gba/gpsp/) | `pixelado-core-gpsp` | Game Boy Advance: gpSP on `retro/`, with the link cable and the wireless adapter played over the network, the room's pause and the screen handed to Party |
 | [`retro/`](retro/) | | the minimal libretro frontend the retro cores are built on (not RetroArch): KMS, ALSA, evdev, the link between the handhelds |
 | [`common/`](common/) | | what the cores share with Party: the channel, the screen handover and the room's socket, in C, and how Party runs a core |
 
-Planned: `snes/`, on `retro/`.
+Planned: `cores/snes/bsnes-mercury/` (and other SNES cores), on `retro/`.
 
 Each core's folder pins its upstream sources (`upstream.lock`) and keeps our changes as patches, with a reproducible
-build: the binary's sha-256 is in the folder's `manifest`. Releases are per core: tags `ds-v<version>` and
-`gba-v<version>`, assets `pixelado-core-ds-<version>.zip` and `pixelado-core-gba-<version>.zip`.
+build: the binary's sha-256 is in the folder's `manifest`. Releases are per core: tags `bananads-v<version>` and
+`gpsp-v<version>`, assets `pixelado-core-bananads-<version>.zip` and `pixelado-core-gpsp-<version>.zip`.
 
 ```sh
-ds/build/build.sh       # Docker; ds/dist/pixelado-core-ds-<version>.zip
-gba/build/build.sh      # Docker; gba/dist/pixelado-core-gba-<version>.zip
-gba/tests/run.sh        # Docker (arm64): common/, retro/ and the GBA link tests
+cores/nds/bananads/build/build.sh    # Docker; cores/nds/bananads/dist/pixelado-core-bananads-<version>.zip
+cores/gba/gpsp/build/build.sh        # Docker; cores/gba/gpsp/dist/pixelado-core-gpsp-<version>.zip
+cores/gba/gpsp/tests/run.sh          # Docker (arm64): common/, retro/ and the GBA link tests
 ```
 
 ## Licence
