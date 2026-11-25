@@ -6,10 +6,11 @@
 #   cores/gba/gpsp/tests/run.sh
 #   PIXELADO_CORE_GPSP_GIT=/path/to/gpsp/clone cores/gba/gpsp/tests/run.sh   (no download of gpSP)
 set -eu
-ROOT=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)         # the repository
+ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)          # cores/gba/gpsp/
+REPO=$(CDPATH= cd -- "$ROOT/../../.." && pwd)          # the repository
 IMAGE=pixelado-cores-gba-test:1
 docker image inspect "$IMAGE" >/dev/null 2>&1 ||
-    docker build --platform linux/arm64 -t "$IMAGE" -f "$ROOT/cores/gba/gpsp/tests/Dockerfile" "$ROOT/cores/gba/gpsp/tests"
-set -- -v "$ROOT:/cores:ro"
+    docker build --platform linux/arm64 -t "$IMAGE" -f "$ROOT/tests/Dockerfile" "$ROOT/tests"
+set -- -v "$REPO:/cores:ro"
 if [ -n "${PIXELADO_CORE_GPSP_GIT:-}" ]; then set -- "$@" -v "$PIXELADO_CORE_GPSP_GIT:/gpsp-git:ro" -e PIXELADO_CORE_GPSP_GIT=/gpsp-git; fi
 docker run --rm --platform linux/arm64 "$@" "$IMAGE" sh /cores/cores/gba/gpsp/tests/in-container.sh
