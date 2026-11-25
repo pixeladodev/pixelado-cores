@@ -12,7 +12,7 @@ the core's side of it.
 | `tests/test_partyctl.c` | a scripted Party and room against the code above: `make -C common test` |
 
 C99 and POSIX, no other dependency. `retro/` (the GBA core, later SNES) builds these sources into its program. The DS
-core keeps its own C++ copy for now (`ds/patches/bananads/0008-…`: `partyctl.{h,cpp}`, and `0006-…`: `roomctl.cpp`):
+core keeps its own C++ copy for now (`cores/nds/bananads/patches/bananads/0008-…`: `partyctl.{h,cpp}`, and `0006-…`: `roomctl.cpp`):
 the same lines and timings, written into BananaDS's frontend before this folder existed. Moving it onto `common/`
 means a new layer on BananaDS and a new DS release, so it waits for the next DS change.
 
@@ -85,25 +85,25 @@ listens), `SESSION state=connected` (a guest, once in the host's session), `SESS
 
 ## The GBA core in Pixelado Party (integration)
 
-What Party needs to run `pixelado-core-gba` (`gba/`), the same way it runs the DS core. Party-side changes, nothing
+What Party needs to run `pixelado-core-gpsp` (`gba/`), the same way it runs the DS core. Party-side changes, nothing
 in the core:
 
 **1. The package (`build/fetch-cores.sh`, `manifest`).** A second core in the app's package, as the DS one:
 
 ```
-cores/gba/pixelado-core-gba   the engine (0755)
-cores/gba/manifest            version=, binary_sha=
+cores/gba/pixelado-core-gpsp   the engine (0755)
+cores/cores/gba/gpsp/manifest            version=, binary_sha=
 cores/gba/LICENSE, NOTICE     GPL-3 and the credits (gpSP is GPL-2.0-or-later)
-cores/gba/SOURCE              "pixelado-core-gba <ver>" and the tree: .../pixelado-cores/tree/gba-v<ver>
+cores/gba/SOURCE              "pixelado-core-gpsp <ver>" and the tree: .../pixelado-cores/tree/gba-v<ver>
 ```
 
-Party's `manifest`: `core_gba_repo=pixeladodev/pixelado-cores`, `core_gba_version=0.1.0`,
-`core_gba_sha=<gba/manifest's binary_sha>`. `fetch-cores.sh` copies `../pixelado-cores/gba/dist/pixelado-core-gba`
-when it is there (with `gba/manifest`, `LICENSE`, `NOTICE`, and writes `SOURCE`), else downloads the release asset
-`pixelado-core-gba-<ver>.zip` (tag `gba-v<ver>`) and checks the binary against `core_gba_sha`. No scripts go with it:
-`run-engine.sh` runs the binary itself. `common.sh`: `CORE_GBA=$APP/cores/gba/pixelado-core-gba`.
+Party's `manifest`: `core_gpsp_repo=pixeladodev/pixelado-cores`, `core_gpsp_version=0.1.0`,
+`core_gpsp_sha=<cores/gba/gpsp/manifest's binary_sha>`. `fetch-cores.sh` copies `../pixelado-cores/cores/gba/gpsp/dist/pixelado-core-gpsp`
+when it is there (with `cores/gba/gpsp/manifest`, `LICENSE`, `NOTICE`, and writes `SOURCE`), else downloads the release asset
+`pixelado-core-gpsp-<ver>.zip` (tag `gpsp-v<ver>`) and checks the binary against `core_gpsp_sha`. No scripts go with it:
+`run-engine.sh` runs the binary itself. `common.sh`: `CORE_GBA=$APP/cores/gba/pixelado-core-gpsp`.
 
-**2. Settings > Emuladores and the library.** GBA is "included" when `cores/gba/pixelado-core-gba` is in the package,
+**2. Settings > Emuladores and the library.** GBA is "included" when `cores/gba/pixelado-core-gpsp` is in the package,
 on by default; off, it leaves the L2/R2 cycle as DS does. The room's `HELLO`/`MEMBER` say `emu=nds,gba` and
 `eng.gba=<version>`. The GBA catalogue: `.gba` files and `.zip` files with a `.gba` inside, from BananaOS's GBA ROM
 folder; keys `gba:<CRC32 of the ROM>` (ROOM-PROTOCOL §10.1; the `gba:?<file>` placeholder keys go). A GBA room seats

@@ -1,0 +1,28 @@
+name: build-bananads
+
+on:
+  push:
+    branches: [main]
+    paths: ['cores/nds/bananads/**', 'NOTICE', 'LICENSE', '.github/workflows/build-bananads.yml']
+  pull_request:
+    paths: ['cores/nds/bananads/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (the binary must match binary_sha in cores/nds/bananads/manifest)
+        run: cores/nds/bananads/build/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pixelado-core-bananads-${{ github.run_number }}
+          path: |
+            cores/nds/bananads/dist/pixelado-core-bananads-*.zip
+            cores/nds/bananads/dist/SHA256SUMS
+          if-no-files-found: error

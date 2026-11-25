@@ -1,5 +1,5 @@
 /* See pixelado/partyctl.h. The channel is only read while Party has the screen (and for a moment as it is let go of):
- * outside that, Party has nothing to say to the core. A C port of the DS core's partyctl.cpp (ds/patches/bananads
+ * outside that, Party has nothing to say to the core. A C port of the DS core's partyctl.cpp (cores/nds/bananads/patches/bananads
  * 0008), with the same lines and the same timings. */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE

@@ -1,4 +1,4 @@
-/* pixelado-retro: the minimal libretro frontend the retro cores (pixelado-core-gba, later -snes) are built on. One
+/* pixelado-retro: the minimal libretro frontend the retro cores (pixelado-core-gpsp, later -snes) are built on. One
  * libretro core linked in statically, run as a program of its own that Pixelado Party launches (common/README.md).
  * This header is the frontend's own modules; nothing here is a public API. */
 #ifndef PX_RETRO_H

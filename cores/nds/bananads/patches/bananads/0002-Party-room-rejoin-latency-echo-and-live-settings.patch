@@ -1,0 +1,336 @@
+Pixelado layer on BananaDS (SuperDrastic bananads/), part 2 of 2.
+
+- The Party's room survives DS Download Play: the emulator no longer stays stopped after
+  the DS menu hands over to the downloaded game (stop_ is cleared before nds_->Start()).
+- Rejoin after a network loss: a client that lost its host keeps that host's address and
+  joins it again when it is heard (every 3 s, for up to 60 s).
+- Real latency: a UDP echo on port 7065 (lanecho) measures each player's round trip;
+  the Party shows the median of the last 5 replies. A client also reports its host's
+  ping (LAN::GetHostPing, melonDS patch 0002).
+- Menu choices last for the whole Party: the in-game menu's settings (FPS counter, 3D effects,
+  shader, fast-forward speed) also reach the settings the running process already read, so the
+  next game opened in the same process keeps them.
+
+Applied with: patch -p1 -d <SuperDrastic tree>, after 0001.
+diff --git a/bananads/docs/LAN.md b/bananads/docs/LAN.md
+index bf7a05f..9e0dd68 100644
+--- a/bananads/docs/LAN.md
++++ b/bananads/docs/LAN.md
+@@ -203,4 +203,20 @@ Numbered on their own from 0001 and applied after all of BananaDS's (bananads/pa
+   of emulated time away, so the game runs on and meets the lost link as a DS does (its own error screen), and after
+   3 s with nothing from the host it is no longer a MP client ("[CLIENT] the host has sent nothing for ... ms" in the
+   log). A host frame resets the count; a hiccup of a timeout or two waits as before.
++- **0010** (LAN, on unless `BANANADS_LAN_GRACE_MS=0`): a missing MP reply is waited for, and its CMD sent again,
++  instead of reported. Real hardware sends a CMD again while a client's reply is missing; melonDS has that retry
++  off and tells the game at once that the client failed, so every late or lost packet reaches the game. Most games
++  shrug it off; Mario Party DS sometimes ends up in a state its link never leaves (40-byte CMDs, the same reply
++  over and over, the picture stopped while both sides keep talking: 2026-11-21 and -22, one or two lost exchanges
++  after a radio gap of ~60 ms, with dozens of earlier losses survived). Now the host waits up to the grace (300 ms
++  by default, `BANANADS_LAN_GRACE_MS`, 0-2000) and sends the CMD again every `BANANADS_LAN_RESEND_MS` (20); a
++  client that gets a CMD it already took (same timestamp) sends its reply to it again and doesn't hand it to the
++  DS twice. The ACK that ends an exchange goes out once more before the next CMD (and with each CMD sent
++  again), and a client takes each ACK once: a lost ACK left the client's game sure its reply hadn't arrived while
++  the host's was sure it had (2026-11-22: the same freeze with no failure reported at all). A client also waits out the grace (plus 100 ms) before 0014's step past a quiet host. The grace only
++  for players that replied lately (fewer than 3 CMDs in a row missed), so a console that left costs one grace,
++  then the usual timeout. A radio gap is a stall, not a lost exchange. `BANANADS_LAN_DROP` (0-500 per mille, test
++  only) drops that share of the MP frames sent; `BANANADS_LAN_DELAY_MS` (0-200, test only) delays them like a weak
++  radio (half-second stretches, `BANANADS_LAN_DELAY_BAD` per cent of them bad, default 10: each frame 0 to that
++  many ms late; order kept, nothing lost). "[diag] LAN recovery:" once a second when any of it happened.
+ - Their other "[diag]" traces log at the Debug level only (`log.level = 0`).
+diff --git a/bananads/src/emu.cpp b/bananads/src/emu.cpp
+index bd67d00..025cda2 100644
+--- a/bananads/src/emu.cpp
++++ b/bananads/src/emu.cpp
+@@ -52,6 +52,13 @@
+ #include "LAN.h"
+ #include "WifiAP.h"
+ #include "MPInterface.h"
++#include <netinet/in.h>
++#include <poll.h>
++#include <sys/socket.h>
++#include <deque>
++#include <map>
++#include <thread>
++#include <time.h>
+ #endif
+ 
+ using namespace melonDS;
+@@ -312,6 +319,7 @@ void Emu::lan_apply() {
+ }
+ 
+ void Emu::lan_apply_one(const LanReq& r) {
++    lan_rejoin_addr_.clear();   // (a choice of the player's: whatever was waiting to rejoin is over)
+ #ifdef BANANADS_LAN
+     if (r.link >= 0) {
+         lan_link_set(r.link == 1);
+@@ -489,7 +497,18 @@ void Emu::lan_net_check(bool now) {
+         return;
+     }
+     if (st.mode == LanMode::Host) lan_start_host(st.max_players);
+-    else if (st.mode == LanMode::Join) lan_start_find("", "");
++    else if (st.mode == LanMode::Join) {
++        // A console joined to a host before the network went (a router that dropped both, 2026-11-21) joins that host
++        // again when it hears it: before, it only looked, found the host and stayed out of the Party.
++        if (!st.addr.empty()) {
++            lan_rejoin_addr_ = st.addr;
++            lan_rejoin_until_us_ = now_us() + 60000000;
++            lan_rejoin_next_us_ = 0;
++            Log(LogLevel::Info, "[wifi] local wireless join: the network is back: joining %s again when it is heard\n",
++                st.addr.c_str());
++        }
++        lan_start_find(st.addr, "");
++    }
+     lan_refresh(true);
+ }
+ 
+@@ -652,6 +671,107 @@ static LAN& lan_iface() {
+     return static_cast<LAN&>(MPInterface::Get());
+ }
+ 
++#ifdef BANANADS_LAN
++// The round trip the Party shows, measured for real. ENet's (melonDS's Player::Ping) counts the time until the other
++// emulator services the network, once a frame in the room: 16-24 ms shown for a network of 2-3 ms (2026-11-21). So
++// each console answers a small UDP echo on its own thread, at once, and asks every player of the session for one
++// each second; the Party shows the median of the last 5. A player that doesn't answer (an older build) keeps ENet's.
++namespace lanecho {
++static constexpr uint16_t kPort = 7065;          // (7063: discovery, 7064: the session)
++static std::mutex mu;
++static std::map<uint32_t, std::deque<double>> rtt;  // network-order IPv4 -> the last round trips, ms
++static std::vector<uint32_t> targets;
++static std::atomic<bool> started{false};
++
++static double now_ms() {
++    timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
++}
++
++static void loop(int fd) {
++    double next = 0;
++    uint32_t seq = 0;
++    for (;;) {
++        const double t = now_ms();
++        if (t >= next) {
++            next = t + 1000;
++            std::vector<uint32_t> to;
++            { std::lock_guard<std::mutex> l(mu); to = targets; }
++            for (uint32_t a : to) {
++                unsigned char m[16] = {'B', 'P', 'E', '?'};
++                ++seq;
++                memcpy(m + 4, &seq, 4);
++                const double now = now_ms();
++                memcpy(m + 8, &now, 8);
++                sockaddr_in sa{};
++                sa.sin_family = AF_INET;
++                sa.sin_port = htons(kPort);
++                sa.sin_addr.s_addr = a;
++                sendto(fd, m, sizeof m, 0, (sockaddr*)&sa, sizeof sa);
++            }
++        }
++        pollfd pf{fd, POLLIN, 0};
++        if (poll(&pf, 1, 100) <= 0) continue;
++        unsigned char m[64];
++        sockaddr_in from{};
++        socklen_t fl = sizeof from;
++        const ssize_t n = recvfrom(fd, m, sizeof m, 0, (sockaddr*)&from, &fl);
++        if (n != 16 || m[0] != 'B' || m[1] != 'P' || m[2] != 'E') continue;
++        if (m[3] == '?') {   // someone's echo: back at once
++            m[3] = '!';
++            sendto(fd, m, 16, 0, (sockaddr*)&from, fl);
++        } else if (m[3] == '!') {
++            double sent;
++            memcpy(&sent, m + 8, 8);
++            const double r = now_ms() - sent;
++            if (r < 0 || r > 2000) continue;
++            std::lock_guard<std::mutex> l(mu);
++            auto& d = rtt[from.sin_addr.s_addr];
++            d.push_back(r);
++            while (d.size() > 5) d.pop_front();
++        }
++    }
++}
++
++static void start() {
++    if (started.exchange(true)) return;
++    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
++    if (fd < 0) return;
++    int one = 1;
++    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
++    sockaddr_in sa{};
++    sa.sin_family = AF_INET;
++    sa.sin_port = htons(kPort);
++    sa.sin_addr.s_addr = htonl(INADDR_ANY);
++    if (bind(fd, (sockaddr*)&sa, sizeof sa) != 0) {
++        Log(LogLevel::Warn, "[wifi] latency echo: UDP %d taken: the Party shows ENet's round trip\n", kPort);
++        close(fd);
++        return;
++    }
++    Log(LogLevel::Info, "[wifi] latency echo on UDP %d\n", kPort);
++    std::thread(loop, fd).detach();
++}
++
++static void set_targets(std::vector<uint32_t> t) {
++    std::lock_guard<std::mutex> l(mu);
++    targets = std::move(t);
++    for (auto it = rtt.begin(); it != rtt.end();)   // (players gone: forgotten)
++        it = std::find(targets.begin(), targets.end(), it->first) == targets.end() ? rtt.erase(it) : std::next(it);
++}
++
++static int ms(uint32_t a) {   // the median of the last round trips, rounded; -1: none yet
++    std::lock_guard<std::mutex> l(mu);
++    auto it = rtt.find(a);
++    if (it == rtt.end() || it->second.empty()) return -1;
++    std::vector<double> v(it->second.begin(), it->second.end());
++    std::sort(v.begin(), v.end());
++    const double m = v[v.size() / 2];
++    return m < 1 ? 1 : (int)(m + 0.5);
++}
++}
++#endif
++
+ static std::string ipv4(uint32_t host_order) {
+     char b[20];
+     snprintf(b, sizeof b, "%u.%u.%u.%u", host_order >> 24, (host_order >> 16) & 255, (host_order >> 8) & 255,
+@@ -1127,6 +1247,8 @@ void Emu::lan_refresh(bool now) {
+     }
+     std::vector<LanPlayer> players;
+     bool host_gone = false;
++    lanecho::start();
++    std::vector<uint32_t> echo_to;
+     for (const LAN::Player& p : lan.GetPlayerList()) {
+         if (p.Status == LAN::Player_Disconnected) {
+             if (p.ID == 0 && ((mode == LanMode::Join && state == LanState::Ready) ||
+@@ -1139,8 +1261,20 @@ void Emu::lan_refresh(bool now) {
+         q.host = p.Status == LAN::Player_Host;
+         q.me = p.IsLocalPlayer;
+         q.ping_ms = q.me || p.Ping == 0 ? -1 : (int)p.Ping;
++        // a guest: the host's Ping comes in the host's own player list (0, its own), so it is this console's round
++        // trip to the host instead (LAN::GetHostPing, BananaDS patch 0109)
++        if (!q.me && q.host && (mode == LanMode::Join || mode == LanMode::Auto)) {
++            const u32 hp = lan.GetHostPing();
++            q.ping_ms = hp ? (int)hp : -1;
++        }
++        // the real round trip, when that player answers the echo (lanecho, above)
++        if (!q.me && p.Address && p.Address != htonl(0x7F000001)) {
++            echo_to.push_back(p.Address);
++            if (const int e = lanecho::ms(p.Address); e >= 0) q.ping_ms = e;
++        }
+         players.push_back(std::move(q));
+     }
++    lanecho::set_targets(std::move(echo_to));
+     if (host_gone) {  // the host quit, or the network lost it
+         Log(LogLevel::Info, "[wifi] local wireless join:%s: the host is gone\n", addr.c_str());
+         lan_stop();
+@@ -1152,6 +1286,7 @@ void Emu::lan_refresh(bool now) {
+             // on "Searching" with Host unable to open the player list. The room is over: Off,
+             // so Lobby can host a new one or look for another.
+             Log(LogLevel::Info, "[wifi] local wireless join: the host closed the room; back to off\n");
++            lan_rejoin_addr_.clear();
+             {
+                 std::lock_guard<std::mutex> l(lan_mu_);
+                 lan_st_.mode = LanMode::Off;
+@@ -1189,6 +1324,25 @@ void Emu::lan_refresh(bool now) {
+         Log(LogLevel::Info, "[wifi] local wireless %s: %zu host%s found%s%s\n", mode == LanMode::Auto ? "auto" : "join", hosts.size(),
+             hosts.size() == 1 ? "" : "s", l.empty() ? "" : ": ", l.c_str());
+     }
++    if (!lan_rejoin_addr_.empty() && mode == LanMode::Join && state != LanState::Ready &&
++        !lan_pending_.load(std::memory_order_acquire)) {
++        const uint64_t now = now_us();
++        if (now > lan_rejoin_until_us_) {
++            Log(LogLevel::Info, "[wifi] local wireless join: %s not heard again in 60 s: no more rejoining\n",
++                lan_rejoin_addr_.c_str());
++            lan_rejoin_addr_.clear();
++        } else if (now >= lan_rejoin_next_us_) {
++            for (const LanHost& h : hosts) {
++                if (h.addr != lan_rejoin_addr_) continue;
++                const std::string a = lan_rejoin_addr_;
++                lan_rejoin_next_us_ = now + 3000000;
++                Log(LogLevel::Info, "[wifi] local wireless join: %s heard again: joining it\n", a.c_str());
++                if (lan_start_join(a)) lan_rejoin_addr_.clear();   // (a failure keeps looking; another try in 3 s)
++                lobbyctl_sync(*this);
++                return;
++            }
++        }
++    }
+     {
+         std::lock_guard<std::mutex> l(lan_mu_);
+         if (lan_pending_.load(std::memory_order_acquire)) return;  // (a newer request: what it shows stays)
+@@ -2445,6 +2599,11 @@ bool Emu::load_rom(const std::string& path) {
+     if (scale != scale_)
+         Log(LogLevel::Warn, "[emu] render.scale=%d needs render.renderer=gengis and render.2d=banana: rendering at 1x\n", scale);
+ 
++    // A stop the previous game left (a DS Download Play child powers the DS off when the host ends the session:
++    // SignalStop, reason PowerOff) is that game's, not this one's. Banana Party boots its lobby ROM again in the same
++    // process, and with the flag still set the lobby's loop stopped at once and the process quit: the player's console
++    // lost the Party's room (2026-11-21).
++    stop_ = false;
+     nds_->Start();
+     prof_ = Profiler::create(cfg_);
+     Log(LogLevel::Info, "[emu] %s started (JIT %s, MAC %02x:%02x:%02x:%02x:%02x:%02x)\n", game_.c_str(),
+diff --git a/bananads/src/emu.h b/bananads/src/emu.h
+index 7e594e2..66dfec4 100644
+--- a/bananads/src/emu.h
++++ b/bananads/src/emu.h
+@@ -189,6 +189,8 @@ public:
+     void cpu_regs(int cpu, uint32_t r[17]) const;  // cpu 0 = ARM9, 1 = ARM7; r[16] = CPSR
+     const melonDS::NDS* nds() const { return nds_.get(); }  // (bananads-difftest's --timing reads its state)
+     const Config& cfg() const { return cfg_; }
++    // a setting changed while the process runs (the in-game menu): the next game this process opens reads it
++    void cfg_set(const std::string& key, const std::string& value) { cfg_.set(key, value); }
+ 
+     // Platform callbacks (platform.cpp) reach the emulator through these.
+     void write_save(const uint8_t* data, uint32_t len, uint32_t off, uint32_t n);
+@@ -291,6 +293,10 @@ private:
+     uint64_t lan_refresh_us_ = 0;
+     size_t lan_hosts_seen_ = 0;              // (the log: hosts found)
+     std::string lan_players_seen_;            // (the log: who is in the session)
++    // Join, back after a network loss: the host this console was joined to, joined again when its beacon is heard
++    // (until lan_rejoin_until_us_; a try every 3 s). Empty: nothing to rejoin
++    std::string lan_rejoin_addr_;
++    uint64_t lan_rejoin_until_us_ = 0, lan_rejoin_next_us_ = 0;
+     char gamecode_[4] = {'#', '#', '#', '#'};  // the cart header's game code (the LAN beacon's tag)
+     // Auto (emulator thread)
+     bool auto_on_ = false;
+diff --git a/bananads/src/frontend_kms.cpp b/bananads/src/frontend_kms.cpp
+index 148681d..235f04e 100644
+--- a/bananads/src/frontend_kms.cpp
++++ b/bananads/src/frontend_kms.cpp
+@@ -1959,9 +1959,21 @@ static void opts_init(const Config& cfg, Display& dp) {
+     pad_init(cfg);
+ }
+ static const int ff_speeds[4] = {0, 2, 3, 99};  // the menu's Fast-forward values: Off, 2x, 3x, Max
++// The settings this process already read: the one run_kms was given and the emulator's own copy. The Party app keeps
++// one process for every game it opens, so a menu choice must reach them too, or the next game reads the old value
++// (the FPS counter turned off came back on the next game).
++static const Config* g_live_cfg;
++static Emu* g_live_emu;
++static void live_opt(const char* key, const std::string& v) {
++    if (g_live_cfg) const_cast<Config*>(g_live_cfg)->set(key, v);
++    if (g_live_emu) g_live_emu->cfg_set(key, v);
++    const std::string env = Config::env_name(key);  // (the environment wins over the settings: follow it too)
++    if (getenv(env.c_str())) setenv(env.c_str(), v.c_str(), 1);
++}
+ static void save_opt(const char* key, const std::string& v) {
+     const char* data = getenv("BANANADS_DATA");
+     set_kv(std::string(data && *data ? data : "/data/bananads") + "/bananads.conf", key, v, " = ");
++    live_opt(key, v);
+ }
+ // F + X: fast-forward on at the speed last chosen in the menu, or off
+ static void ff_toggle() { g_ff = g_ff.load() ? 0 : g_opts.ff_speed; }
+@@ -1998,6 +2010,7 @@ static void mh_opt_set(void* c, int i, int v) {
+         }
+         // the same choice as Settings > Nintendo DS > Shader (both emulators read it from there)
+         set_kv("/data/banana/superdrastic.conf", "DSFLIP_SHADER", g_opts.shaders[v], "=");
++        live_opt("kms.shader", g_opts.shaders[v]);  // (this process: the next game opens with it)
+     } else if (i == 2) {
+         g_opts.fps = v != 0;
+         save_opt("kms.fps", v ? "on" : "off");
+@@ -2111,6 +2124,8 @@ static void mh_lan_link_set(void*, int direct) {
+ // ---- the frontend ---------------------------------------------------------------------------------------------
+ 
+ int run_kms(Emu& emu, const Config& cfg) {
++    g_live_cfg = &cfg;
++    g_live_emu = &emu;
+     g_quit = false;  // a game that already quit can run again in this same process
+     g_save = false;
+     g_nosave = false;
